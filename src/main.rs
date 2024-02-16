@@ -24,6 +24,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, Error};
 use clap::Parser;
 use once_cell::sync::OnceCell;
+use regex::RegexBuilder;
 use rustdoc_types::{
     Crate, GenericArg, GenericArgs, GenericBound, Item, ItemEnum, ItemKind, Term,
     TraitBoundModifier, Type, TypeBinding, TypeBindingKind, Visibility,
@@ -216,7 +217,30 @@ impl<'a> ToString for Segment<'a> {
 
             Self::StructItem(item) => {
                 let name = unwrap_or_empty!(item.name);
-                format!("# {}\n\n{}\n", name, unwrap_or_empty!(item.docs))
+                let methods = Segment::ItemEnum(&item.inner).to_string();
+                let methods = if methods.is_empty() {
+                    "".to_string()
+                } else {
+                    format!(
+                        "# Methods\n| Method | Description |\n| --- | --- |\n{}",
+                        methods
+                            .split('\n')
+                            .map(|line| line.split('\t').collect::<Vec<&str>>())
+                            .map(|line| format!(
+                                "| [{}]({}/{}.md) | {} |",
+                                line[0], name, line[0], line[1]
+                            ))
+                            .collect::<Vec<String>>()
+                            .join("\n")
+                    )
+                };
+
+                format!(
+                    "# {}\n\n{}\n\n{}",
+                    name,
+                    unwrap_or_empty!(item.docs),
+                    methods
+                )
             }
 
             Self::ItemEnum(item) => match item {
@@ -235,6 +259,35 @@ impl<'a> ToString for Segment<'a> {
                             .map(|t| Segment::Type(t).to_string())
                             .unwrap_or("".to_string())
                     )
+                }
+
+                ItemEnum::Struct(_) => {
+                    let re = RegexBuilder::new(r"(?:^\s*\n*)*(?P<caption>^\w*.*)(?:\n?)$?")
+                        .multi_line(true)
+                        .build()
+                        .unwrap();
+                    let methods = get_struct_methods(item);
+                    if methods.len() > 0 {
+                        methods
+                            .iter()
+                            .map(|item| {
+                                format!(
+                                    "{}\t{}",
+                                    unwrap_or_empty!(item.name).trim(),
+                                    unwrap_or_empty!(re
+                                        .captures(unwrap_or_empty!(item.docs))
+                                        .map(|cap| cap
+                                            .name("caption")
+                                            .map(|m| m.as_str().to_string()))
+                                        .flatten())
+                                    .trim()
+                                )
+                            })
+                            .collect::<Vec<String>>()
+                            .join("\n")
+                    } else {
+                        "".to_string()
+                    }
                 }
 
                 _ => unimplemented!("Unimplemented item: {:?}", item),
