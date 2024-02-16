@@ -21,11 +21,15 @@ use std::fs::{create_dir_all, File};
 use std::io::{BufReader, Write};
 use std::path::{Path, PathBuf};
 
+use anyhow::{anyhow, Error};
 use clap::Parser;
+use once_cell::sync::OnceCell;
 use rustdoc_types::{
     Crate, GenericArg, GenericArgs, GenericBound, Item, ItemEnum, ItemKind, Term,
     TraitBoundModifier, Type, TypeBinding, TypeBindingKind, Visibility,
 };
+
+static CRATE: OnceCell<Crate> = OnceCell::new();
 
 #[derive(Debug, Parser, PartialEq)]
 #[clap(author, version, about, long_about= None)]
@@ -52,7 +56,7 @@ macro_rules! unwrap_or_empty {
     };
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Error> {
     let args = Args::parse();
 
     let mut builder = rustdoc_json::Builder::default()
@@ -64,12 +68,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         builder = builder.package(pkg);
     }
 
-    let json_path = builder.build()?;
-
-    // Extract information from rustdoc JSON
-    let file = File::open(json_path)?;
-    let reader = BufReader::new(file);
-    let crate_: Crate = serde_json::from_reader(reader)?;
+    // Crate information from rustdoc JSON
+    CRATE.get_or_try_init(|| {
+        let json_path = builder.build()?;
+        let file = File::open(&json_path).map_err(|e| anyhow!(e))?;
+        let reader = BufReader::new(file);
+        serde_json::from_reader(reader).map_err(|e| anyhow!(e))
+    })?;
+    let crate_ = CRATE.get().unwrap();
 
     let selected_kind: ItemKind = serde_plain::from_str(&args.kind)?;
 
@@ -91,20 +97,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     match selected_kind {
         ItemKind::Function => {
             for i in items {
-                let mut root_path = PathBuf::from(&args.output_path);
-                for sub_path in crate_
-                    .paths
-                    .get(&i.id)
-                    .map(|summary| &summary.path)
-                    .map(|p| p.split_last().map(|(_, ar)| ar).unwrap())
-                    .unwrap()
-                {
-                    root_path = root_path.join(sub_path);
-                }
-                let filename = root_path.join(format!("{}.md", i.name.as_ref().unwrap()));
-                create_dir_all(root_path)?;
-                let mut file = File::create(filename)?;
-                file.write_all(Segment::FunctionItem(i).to_string().as_bytes())?;
+                write_segment(Segment::FunctionItem(i), &args.output_path)?;
+            }
+        }
+        ItemKind::Struct => {
+            for i in items {
+                write_segment(Segment::StructItem(i), &args.output_path)?;
             }
         }
         _ => {
@@ -115,8 +113,42 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+fn write_segment(segment: Segment, root: &str) -> Result<(), std::io::Error> {
+    let filename = md_filename(root, segment.as_ref())?;
+    let mut file = File::create(filename)?;
+    file.write_all(segment.to_string().as_bytes())
+}
+
+impl<'a> AsRef<Item> for Segment<'a> {
+    fn as_ref(&self) -> &Item {
+        match self {
+            Self::FunctionItem(item) => item,
+            Self::StructItem(item) => item,
+            _ => unimplemented!(),
+        }
+    }
+}
+
+fn md_filename(root: &str, item: &Item) -> Result<PathBuf, std::io::Error> {
+    let mut root_path = PathBuf::from(root);
+    for sub_path in CRATE
+        .get()
+        .unwrap()
+        .paths
+        .get(&item.id)
+        .map(|summary| &summary.path)
+        .map(|full_path| full_path.split_last().map(|(_, path)| path).unwrap())
+        .unwrap()
+    {
+        root_path = root_path.join(sub_path);
+    }
+    create_dir_all(&root_path)?;
+    Ok(root_path.join(format!("{}.md", item.name.as_ref().unwrap())))
+}
+
 enum Segment<'a> {
     FunctionItem(&'a Item),
+    StructItem(&'a Item),
     ItemEnum(&'a ItemEnum),
     ResolvedPath(&'a rustdoc_types::Path),
     GenericArgs(&'a GenericArgs),
@@ -139,9 +171,13 @@ impl<'a> ToString for Segment<'a> {
                 )
             }
 
+            Self::StructItem(item) => {
+                let name = unwrap_or_empty!(item.name);
+                format!("# {}\n\n{}\n", name, unwrap_or_empty!(item.docs),)
+            }
+
             Self::ItemEnum(item) => match item {
                 ItemEnum::Function(f) => {
-                    let _ = 1;
                     format!(
                         "({}) -> {}",
                         f.decl
