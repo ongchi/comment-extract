@@ -15,22 +15,22 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#![feature(box_patterns)]
+#![feature(once_cell_try)]
 
 use std::fs::{create_dir_all, File};
 use std::io::{BufReader, Write};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use anyhow::{anyhow, Error};
 use clap::Parser;
-use once_cell::sync::OnceCell;
 use regex::RegexBuilder;
 use rustdoc_types::{
     Crate, GenericArg, GenericArgs, GenericBound, Item, ItemEnum, ItemKind, Term,
     TraitBoundModifier, Type, TypeBinding, TypeBindingKind, Visibility,
 };
 
-static CRATE: OnceCell<Crate> = OnceCell::new();
+static CRATE: OnceLock<Crate> = OnceLock::new();
 
 #[derive(Debug, Parser, PartialEq)]
 #[clap(author, version, about, long_about= None)]

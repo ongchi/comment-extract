@@ -128,7 +128,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
- "once_cell",
  "regex",
  "rustdoc-json",
  "rustdoc-types",
