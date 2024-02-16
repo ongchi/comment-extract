@@ -7,9 +7,10 @@ Experimental doc comments extractor for [DataFusion](https://github.com/apache/a
 ```shell
 # Under arrow-datafusion project folder
 comment-extract \
-    --package "datafusion-expr" \
-    --module-path "datafusion_expr::expr_fn" \
-    --kind function
+    --package datafusion-expr \
+    --module-path datafusion_expr::expr_fn \
+    --kind function \
+    --output-path generated
 ```
 
 ## Note

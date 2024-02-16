@@ -17,14 +17,14 @@
 
 #![feature(box_patterns)]
 
-use std::fs::File;
-use std::io::BufReader;
-use std::path::Path;
+use std::fs::{create_dir_all, File};
+use std::io::{BufReader, Write};
+use std::path::{Path, PathBuf};
 
 use clap::Parser;
 use rustdoc_types::{
-    Crate, GenericArg, GenericArgs, GenericBound, ItemEnum, ItemKind, Term, TraitBoundModifier,
-    Type, TypeBinding, TypeBindingKind, Visibility,
+    Crate, GenericArg, GenericArgs, GenericBound, Item, ItemEnum, ItemKind, Term,
+    TraitBoundModifier, Type, TypeBinding, TypeBindingKind, Visibility,
 };
 
 #[derive(Debug, Parser, PartialEq)]
@@ -41,6 +41,9 @@ struct Args {
 
     #[clap(long, default_value = "function", help = "Filter by item kind")]
     kind: String,
+
+    #[clap(long, help = "The path to generated outputs")]
+    output_path: String,
 }
 
 macro_rules! unwrap_or_empty {
@@ -85,18 +88,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .filter(|item| item.visibility == Visibility::Public)
         .collect::<Vec<_>>();
 
-    for i in items {
-        let name = unwrap_or_empty!(i.name);
-        println!("# {}\n", name);
-        println!("fn {}{}\n", name, Segment::ItemEnum(&i.inner).to_string());
-        println!("{}\n", unwrap_or_empty!(i.docs));
-        println!();
+    match selected_kind {
+        ItemKind::Function => {
+            for i in items {
+                let mut root_path = PathBuf::from(&args.output_path);
+                for sub_path in crate_
+                    .paths
+                    .get(&i.id)
+                    .map(|summary| &summary.path)
+                    .map(|p| p.split_last().map(|(_, ar)| ar).unwrap())
+                    .unwrap()
+                {
+                    root_path = root_path.join(sub_path);
+                }
+                let filename = root_path.join(format!("{}.md", i.name.as_ref().unwrap()));
+                create_dir_all(root_path)?;
+                let mut file = File::create(filename)?;
+                file.write_all(Segment::FunctionItem(i).to_string().as_bytes())?;
+            }
+        }
+        _ => {
+            unimplemented!("Unimplemented ItemKind: {:?}", selected_kind)
+        }
     }
 
     Ok(())
 }
 
 enum Segment<'a> {
+    FunctionItem(&'a Item),
     ItemEnum(&'a ItemEnum),
     ResolvedPath(&'a rustdoc_types::Path),
     GenericArgs(&'a GenericArgs),
@@ -108,6 +128,17 @@ enum Segment<'a> {
 impl<'a> ToString for Segment<'a> {
     fn to_string(&self) -> String {
         match self {
+            Self::FunctionItem(item) => {
+                let name = unwrap_or_empty!(item.name);
+                format!(
+                    "# {}\n\nfn {}{}\n\n{}\n",
+                    name,
+                    name,
+                    Segment::ItemEnum(&item.inner).to_string(),
+                    unwrap_or_empty!(item.docs)
+                )
+            }
+
             Self::ItemEnum(item) => match item {
                 ItemEnum::Function(f) => {
                     let _ = 1;
