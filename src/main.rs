@@ -94,15 +94,17 @@ fn main() -> Result<(), Error> {
         .filter(|item| item.visibility == Visibility::Public)
         .collect::<Vec<_>>();
 
+    let output_path = PathBuf::from(args.output_path);
+
     match selected_kind {
         ItemKind::Function => {
             for i in items {
-                write_segment(Segment::FunctionItem(i), &args.output_path)?;
+                write_segment(Segment::FunctionItem(i), &output_path)?;
             }
         }
         ItemKind::Struct => {
             for i in items {
-                write_segment(Segment::StructItem(i), &args.output_path)?;
+                write_segment(Segment::StructItem(i), &output_path)?;
             }
         }
         _ => {
@@ -113,10 +115,25 @@ fn main() -> Result<(), Error> {
     Ok(())
 }
 
-fn write_segment(segment: Segment, root: &str) -> Result<(), std::io::Error> {
+fn write_segment(segment: Segment, root: &Path) -> Result<(), std::io::Error> {
     let filename = md_filename(root, segment.as_ref())?;
-    let mut file = File::create(filename)?;
-    file.write_all(segment.to_string().as_bytes())
+    let mut file = File::create(&filename)?;
+    file.write_all(segment.to_string().as_bytes())?;
+    match segment {
+        Segment::StructItem(s) => {
+            for method in get_struct_methods(&s.inner) {
+                write_segment(
+                    Segment::FunctionItem(method),
+                    &filename
+                        .parent()
+                        .unwrap()
+                        .join(&unwrap_or_empty!(segment.as_ref().name)),
+                )?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 impl<'a> AsRef<Item> for Segment<'a> {
@@ -129,21 +146,47 @@ impl<'a> AsRef<Item> for Segment<'a> {
     }
 }
 
-fn md_filename(root: &str, item: &Item) -> Result<PathBuf, std::io::Error> {
+fn md_filename(root: &Path, item: &Item) -> Result<PathBuf, std::io::Error> {
     let mut root_path = PathBuf::from(root);
-    for sub_path in CRATE
-        .get()
-        .unwrap()
-        .paths
-        .get(&item.id)
-        .map(|summary| &summary.path)
-        .map(|full_path| full_path.split_last().map(|(_, path)| path).unwrap())
-        .unwrap()
-    {
-        root_path = root_path.join(sub_path);
+    if let Some(summary) = CRATE.get().unwrap().paths.get(&item.id) {
+        for sub_path in summary
+            .path
+            .split_last()
+            .map(|(_, paths)| paths)
+            .unwrap_or_default()
+        {
+            root_path = root_path.join(sub_path);
+        }
     }
     create_dir_all(&root_path)?;
     Ok(root_path.join(format!("{}.md", item.name.as_ref().unwrap())))
+}
+
+fn get_struct_methods(struct_: &ItemEnum) -> Vec<&Item> {
+    let crate_ = CRATE.get().unwrap();
+
+    match struct_ {
+        ItemEnum::Struct(s) => s
+            .impls
+            .iter()
+            .filter_map(|id| crate_.index.get(id))
+            .filter_map(|item| match item.inner {
+                ItemEnum::Impl(ref impl_) => match impl_.trait_ {
+                    Some(_) => None,
+                    None => Some(
+                        impl_
+                            .items
+                            .iter()
+                            .map(|id| crate_.index.get(id).unwrap())
+                            .collect::<Vec<&Item>>(),
+                    ),
+                },
+                _ => None,
+            })
+            .flatten()
+            .collect(),
+        _ => unreachable!(),
+    }
 }
 
 enum Segment<'a> {
@@ -173,7 +216,7 @@ impl<'a> ToString for Segment<'a> {
 
             Self::StructItem(item) => {
                 let name = unwrap_or_empty!(item.name);
-                format!("# {}\n\n{}\n", name, unwrap_or_empty!(item.docs),)
+                format!("# {}\n\n{}\n", name, unwrap_or_empty!(item.docs))
             }
 
             Self::ItemEnum(item) => match item {
@@ -193,6 +236,7 @@ impl<'a> ToString for Segment<'a> {
                             .unwrap_or("".to_string())
                     )
                 }
+
                 _ => unimplemented!("Unimplemented item: {:?}", item),
             },
 
