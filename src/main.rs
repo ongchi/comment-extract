@@ -190,6 +190,52 @@ fn get_struct_methods(struct_: &ItemEnum) -> Vec<&Item> {
     }
 }
 
+fn hide_code_block_lines(docs: &str) -> String {
+    let re_code = RegexBuilder::new(r"^```(?<rust_code>(rust(\s*|\s+.*)?)|\s*)?$")
+        .build()
+        .unwrap();
+    let re_show = RegexBuilder::new(r"^[^#].*|^#\[.*").build().unwrap();
+
+    enum Status {
+        InRustCodeBlock,
+        InCodeBlock,
+        NotInCodeBlock,
+    }
+
+    let mut filtered_docs: Vec<&str> = Vec::new();
+    let mut stat = Status::NotInCodeBlock;
+
+    for line in docs.lines() {
+        match stat {
+            Status::InRustCodeBlock => {
+                if let Some(_) = re_show.captures(line) {
+                    filtered_docs.push(line);
+                }
+                if let Some(_) = re_code.captures(line) {
+                    stat = Status::NotInCodeBlock;
+                }
+            }
+            Status::InCodeBlock => {
+                filtered_docs.push(line);
+                if let Some(_) = re_code.captures(line) {
+                    stat = Status::NotInCodeBlock;
+                }
+            }
+            Status::NotInCodeBlock => {
+                filtered_docs.push(line);
+                if let Some(cap) = re_code.captures(line) {
+                    stat = match cap.name("rust_code") {
+                        Some(_) => Status::InRustCodeBlock,
+                        _ => Status::InCodeBlock,
+                    };
+                };
+            }
+        }
+    }
+
+    filtered_docs.join("\n")
+}
+
 enum Segment<'a> {
     FunctionItem(&'a Item),
     StructItem(&'a Item),
@@ -211,7 +257,7 @@ impl<'a> ToString for Segment<'a> {
                     name,
                     name,
                     Segment::ItemEnum(&item.inner).to_string(),
-                    unwrap_or_empty!(item.docs)
+                    hide_code_block_lines(unwrap_or_empty!(item.docs))
                 )
             }
 
@@ -238,7 +284,7 @@ impl<'a> ToString for Segment<'a> {
                 format!(
                     "# {}\n\n{}\n\n{}",
                     name,
-                    unwrap_or_empty!(item.docs),
+                    hide_code_block_lines(unwrap_or_empty!(item.docs)),
                     methods
                 )
             }
@@ -278,7 +324,7 @@ impl<'a> ToString for Segment<'a> {
                                         .captures(unwrap_or_empty!(item.docs))
                                         .map(|cap| cap
                                             .name("caption")
-                                            .map(|m| m.as_str().to_string()))
+                                            .map(|m| hide_code_block_lines(m.as_str())))
                                         .flatten())
                                     .trim()
                                 )
