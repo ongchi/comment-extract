@@ -308,7 +308,7 @@ impl<'a> std::fmt::Display for Segment<'a> {
                 if args.len() > 0 || bindings.len() > 0 {
                     write!(
                         f,
-                        "<{}>",
+                        "&lt;{}&gt;",
                         args.iter()
                             .map(|arg| match arg {
                                 GenericArg::Lifetime(a) => a.clone(),
