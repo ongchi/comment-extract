@@ -154,7 +154,20 @@ impl<'a> std::fmt::Display for Segment<'a> {
                 let name = self.name();
                 write!(
                     f,
-                    "# {}\n\nfn {}{}\n\n{}\n",
+                    r#"
+# {}
+
+<dl>
+    <dt class="sig">
+    <span class="sig-name">
+        <span class="pre">{}</span>
+    </span>
+    {}
+    </dt>
+</dl>
+
+{}
+"#,
                     name,
                     name,
                     self.extract(SegmentType::ItemEnum(&item.inner)),
@@ -197,17 +210,26 @@ impl<'a> std::fmt::Display for Segment<'a> {
                 ItemEnum::Function(func) => {
                     write!(
                         f,
-                        "({}) -> {}",
+                        r#"<span class="sig-paren">(</span>
+{}
+<span class="sig-paren">)</span>
+{}"#,
                         func.decl
                             .inputs
                             .iter()
-                            .map(|(n, t)| format!("{}: {}", n, self.extract(SegmentType::Type(t))))
+                            .map(|(n, t)| format!(
+                                r#"<em class="sig-param n">
+    <span class="pre">{}</span>: <span class="pre">{}</span>
+</em>"#,
+                                n,
+                                self.extract(SegmentType::Type(t))
+                            ))
                             .collect::<Vec<String>>()
                             .join(", "),
                         func.decl
                             .output
                             .as_ref()
-                            .map(|t| self.extract(SegmentType::Type(t)).to_string())
+                            .map(|t| format!(" → {}", self.extract(SegmentType::Type(t))))
                             .unwrap_or("".to_string())
                     )
                 }
