@@ -407,6 +407,7 @@ impl<'a> std::fmt::Display for Segment<'a> {
     }
 }
 
+// Remove lines starts with `#` in code blocks
 fn hide_code_block_lines(docs: &str) -> String {
     let re_code = RegexBuilder::new(r"^```(?<rust_code>(rust(\s*|\s+.*)?)|\s*)?$")
         .build()
@@ -439,12 +440,22 @@ fn hide_code_block_lines(docs: &str) -> String {
                 }
             }
             Status::NotInCodeBlock => {
-                filtered_docs.push(line);
                 if let Some(cap) = re_code.captures(line) {
                     stat = match cap.name("rust_code") {
-                        Some(_) => Status::InRustCodeBlock,
-                        _ => Status::InCodeBlock,
+                        Some(_) => {
+                            // The rustdoc code blocks without specifyinig a language would be `rust`, and
+                            // may contain additional attributes.
+                            // Replace with this line to work with Sphinix.
+                            filtered_docs.push("```rust");
+                            Status::InRustCodeBlock
+                        }
+                        _ => {
+                            filtered_docs.push(line);
+                            Status::InCodeBlock
+                        }
                     };
+                } else {
+                    filtered_docs.push(line);
                 };
             }
         }
