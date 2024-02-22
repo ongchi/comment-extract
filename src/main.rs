@@ -67,14 +67,16 @@ fn main() -> Result<(), Error> {
     let segment = Segment::new(&crate_);
 
     let selected_kind: ItemKind = serde_plain::from_str(&args.kind)?;
+    let selected_path: Option<PathBuf> = args.module_path.as_ref().map(|p| p.split("::").collect());
 
     let items = crate_
         .paths
         .iter()
         .filter(|(_, item)| item.kind == selected_kind)
         .filter(|(_, item)| {
-            if let Some(ref module) = args.module_path {
-                item.path.join("::").starts_with(module)
+            if let Some(selected_path) = &selected_path {
+                let this_path: PathBuf = item.path.iter().collect();
+                this_path.ancestors().any(|p| p == selected_path)
             } else {
                 true
             }
