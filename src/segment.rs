@@ -27,7 +27,7 @@ use rustdoc_types::{
 };
 
 use crate::utils::{associated_methods, caption, hide_code_block_lines};
-use crate::Args;
+use crate::Config;
 
 #[derive(Debug)]
 pub struct ExportOption {
@@ -44,7 +44,7 @@ pub struct SegmentCollections {
 }
 
 impl<'a> SegmentCollections {
-    fn _items_to_export(&'a self) -> Result<Vec<ItemRef<'a>>, Error> {
+    fn _items_to_extract(&'a self) -> Result<Vec<ItemRef<'a>>, Error> {
         let mut items = vec![];
 
         for option in &self.export_options {
@@ -71,9 +71,9 @@ impl<'a> SegmentCollections {
         Ok(items)
     }
 
-    pub fn export(&'a self) -> Result<(), Error> {
-        let export_items = self._items_to_export()?;
-        for item_ref in &export_items {
+    pub fn extract(&'a self) -> Result<(), Error> {
+        let extract_items = self._items_to_extract()?;
+        for item_ref in &extract_items {
             item_ref.write_md(&self.output_root)?;
         }
 
@@ -81,44 +81,43 @@ impl<'a> SegmentCollections {
     }
 }
 
-impl TryFrom<Args> for SegmentCollections {
+impl TryFrom<Config> for SegmentCollections {
     type Error = Error;
 
-    fn try_from(value: Args) -> Result<Self, Self::Error> {
-        let mut builder = rustdoc_json::Builder::default()
-            .manifest_path(&value.manifest_path)
-            .toolchain("nightly")
-            .all_features(true)
-            .clear_target_dir();
+    fn try_from(value: Config) -> Result<Self, Self::Error> {
+        let manifest_path = value.manifest_path.as_deref().unwrap_or("Cargo.toml");
+        let output_root = PathBuf::from(value.output_path);
+        let mut packages = HashMap::new();
+        let mut export_options = vec![];
 
-        if let Some(pkg) = &value.package {
-            builder = builder.package(pkg);
+        for pkg in value.packages {
+            if packages.get(&pkg.name).is_none() {
+                let builder = rustdoc_json::Builder::default()
+                    .manifest_path(manifest_path)
+                    .package(&pkg.name)
+                    .toolchain("nightly")
+                    .all_features(true)
+                    .clear_target_dir();
+
+                let json_path = builder.build()?;
+                let file = File::open(json_path).map_err(|e| anyhow!(e))?;
+                let reader = BufReader::new(file);
+                let crate_: Crate = serde_json::from_reader(reader)?;
+
+                packages.insert(pkg.name.clone(), crate_);
+            }
+
+            export_options.push(ExportOption {
+                package: pkg.name,
+                module_path: pkg.module_path.map(|s| s.split("::").collect()),
+                kind: serde_plain::from_str(&pkg.kind)?,
+            });
         }
-
-        let json_path = builder.build()?;
-        let file = File::open(json_path).map_err(|e| anyhow!(e))?;
-        let reader = BufReader::new(file);
-        let crate_: Crate = serde_json::from_reader(reader)?;
-
-        let package = match value.package {
-            Some(pkg) => pkg,
-            None => crate_
-                .index
-                .get(&crate_.root)
-                .and_then(|item| item.name.clone())
-                .unwrap(),
-        };
-
-        let packages = [(package.clone(), crate_)].into_iter().collect();
 
         Ok(Self {
             packages,
-            export_options: vec![ExportOption {
-                package,
-                module_path: value.module_path.map(|s| s.split("::").collect()),
-                kind: serde_plain::from_str(&value.kind)?,
-            }],
-            output_root: PathBuf::from(value.output_path),
+            export_options,
+            output_root,
         })
     }
 }

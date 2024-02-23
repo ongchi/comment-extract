@@ -18,7 +18,7 @@
 mod segment;
 mod utils;
 
-use std::path::PathBuf;
+use std::fs::read_to_string;
 
 use anyhow::Error;
 use clap::Parser;
@@ -29,24 +29,13 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Parser, PartialEq)]
 #[clap(author, version, about, long_about= None)]
 struct Args {
-    #[clap(long, default_value = "Cargo.toml", help = "Path to Cargo.toml")]
-    manifest_path: String,
-
-    #[clap(long, help = "Package to extract")]
-    package: Option<String>,
-
-    #[clap(long, help = "Filter by module path")]
-    module_path: Option<String>,
-
-    #[clap(long, default_value = "function", help = "Filter by item kind")]
-    kind: String,
-
-    #[clap(long, help = "The path to generated outputs")]
-    output_path: String,
+    #[clap(long, default_value = "rustdoc-extract.toml")]
+    config: String,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
 struct Config {
+    manifest_path: Option<String>,
     output_path: String,
     packages: Vec<Package>,
 }
@@ -54,13 +43,14 @@ struct Config {
 #[derive(Debug, Deserialize, Serialize)]
 struct Package {
     name: String,
-    module_path: Option<PathBuf>,
+    module_path: Option<String>,
     kind: String,
 }
 
 fn main() -> Result<(), Error> {
     let args = Args::parse();
-    let collections: SegmentCollections = args.try_into()?;
+    let config: Config = toml::from_str(&read_to_string(args.config)?)?;
+    let collections: SegmentCollections = config.try_into()?;
 
-    collections.export()
+    collections.extract()
 }
