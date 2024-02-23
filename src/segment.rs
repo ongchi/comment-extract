@@ -21,13 +21,12 @@ use std::io::{BufReader, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Error};
-use regex::RegexBuilder;
 use rustdoc_types::{
-    Crate, GenericArg, GenericArgs, GenericBound, Item, ItemEnum, ItemKind, Term,
+    Crate, GenericArg, GenericArgs, GenericBound, Item, ItemEnum, ItemKind, ItemSummary, Term,
     TraitBoundModifier, Type, TypeBinding, TypeBindingKind, Visibility,
 };
 
-use crate::utils::{extract_associated_methods, hide_code_block_lines};
+use crate::utils::{associated_methods, caption, hide_code_block_lines};
 use crate::Args;
 
 #[derive(Debug)]
@@ -45,40 +44,27 @@ pub struct SegmentCollections {
 }
 
 impl<'a> SegmentCollections {
-    fn _items_to_export(&'a self) -> Result<Vec<ExportItem<'a>>, Error> {
+    fn _items_to_export(&'a self) -> Result<Vec<ItemRef<'a>>, Error> {
         let mut items = vec![];
 
         for option in &self.export_options {
             let crate_ = self.packages.get(&option.package).unwrap();
             items.extend(
-                crate_
-                    .paths
-                    .iter()
-                    .filter(|(_, summary)| summary.kind == option.kind)
-                    .filter(|(_, summary)| {
-                        if let Some(selected_path) = &option.module_path {
-                            let this_path = summary.path.iter().collect::<PathBuf>();
-                            this_path.ancestors().any(|p| p == selected_path)
-                        } else {
-                            true
-                        }
+                (crate_.paths.iter())
+                    .filter(|(_, summ)| summ.kind == option.kind)
+                    .filter(|(_, summ)| {
+                        option
+                            .module_path
+                            .as_ref()
+                            .map(|p| summ.path.iter().collect::<PathBuf>().starts_with(p))
+                            .unwrap_or(true)
                     })
-                    .filter_map(|(id, _)| match crate_.index.get(id) {
-                        Some(item) => {
-                            if item.visibility == Visibility::Public {
-                                let export_item = match option.kind {
-                                    ItemKind::Function => ExportItem::Function { crate_, item },
-                                    ItemKind::Struct => ExportItem::Struct { crate_, item },
-                                    _ => unimplemented!("unsupported item kind: {:?}", option.kind),
-                                };
-                                Some((id.clone(), export_item))
-                            } else {
-                                None
-                            }
-                        }
-                        None => None,
-                    })
-                    .map(|(_, item)| item),
+                    .filter_map(|(id, summ)| crate_.index.get(id).map(|item| (id, item, summ)))
+                    .filter(|(_, item, _)| item.visibility == Visibility::Public)
+                    .flat_map(|(_, item, item_summary)| {
+                        let root = ItemRef::new(crate_, item, Summary::ItemSummary(item_summary));
+                        root.associated_methods().into_iter().chain([root])
+                    }),
             );
         }
 
@@ -86,17 +72,9 @@ impl<'a> SegmentCollections {
     }
 
     pub fn export(&'a self) -> Result<(), Error> {
-        let output_root: PathBuf = self.output_root.clone();
-
-        for item in self._items_to_export()? {
-            match item {
-                ExportItem::Function { crate_, item } => Segment::new(crate_)
-                    .extract(SegmentType::FunctionItem(item))
-                    .write_md(&output_root)?,
-                ExportItem::Struct { crate_, item } => Segment::new(crate_)
-                    .extract(SegmentType::StructItem(item))
-                    .write_md(&output_root)?,
-            }
+        let export_items = self._items_to_export()?;
+        for item_ref in &export_items {
+            item_ref.write_md(&self.output_root)?;
         }
 
         Ok(())
@@ -145,117 +123,98 @@ impl TryFrom<Args> for SegmentCollections {
     }
 }
 
+// Save necessory information for associated function of a struct
+// which does not have an ItemSummary.
 #[derive(Debug)]
-pub enum ExportItem<'a> {
-    Function { crate_: &'a Crate, item: &'a Item },
-    Struct { crate_: &'a Crate, item: &'a Item },
-}
-
-pub struct Segment<'a> {
-    crate_: &'a Crate,
-    type_: SegmentType<'a>,
+enum Summary<'a> {
+    ItemSummary(&'a ItemSummary),
+    Path(PathBuf),
 }
 
 #[derive(Debug)]
-pub enum SegmentType<'a> {
-    Empty,
-    FunctionItem(&'a Item),
-    StructItem(&'a Item),
-    ItemEnum(&'a ItemEnum),
-    ResolvedPath(&'a rustdoc_types::Path),
-    GenericArgs(&'a GenericArgs),
-    Type(&'a Type),
-    GenericBound(&'a GenericBound),
-    TypeBinding(&'a TypeBinding),
+pub struct ItemRef<'a> {
+    pkg: &'a Crate,
+    item: &'a Item,
+    summary: Summary<'a>,
 }
 
-impl<'a> Segment<'a> {
-    pub fn new(crate_: &'a Crate) -> Self {
-        Self {
-            crate_,
-            type_: SegmentType::Empty,
+impl<'a> ItemRef<'a> {
+    fn new(pkg: &'a Crate, item: &'a Item, summary: Summary<'a>) -> Self {
+        Self { pkg, item, summary }
+    }
+
+    fn name(&self) -> &'a str {
+        self.item.name.as_deref().unwrap_or("")
+    }
+
+    fn kind(&self) -> ItemKind {
+        match self.summary {
+            Summary::ItemSummary(summ) => summ.kind.clone(),
+            Summary::Path(_) => ItemKind::Function,
         }
     }
 
-    pub fn extract(&self, type_: SegmentType<'a>) -> Self {
-        Self {
-            crate_: self.crate_,
-            type_,
+    fn path(&self) -> PathBuf {
+        match &self.summary {
+            Summary::ItemSummary(summ) => summ.path.iter().collect(),
+            Summary::Path(p) => p.clone(),
         }
     }
 
-    pub fn write_md(&self, root: &Path) -> Result<(), std::io::Error> {
-        let mut root = PathBuf::from(root);
-        if let Some(summary) = self.crate_.paths.get(&self._item().id) {
-            for sub_path in summary
-                .path
-                .split_last()
-                .map(|(_, paths)| paths)
-                .unwrap_or_default()
-            {
-                root = root.join(sub_path);
-            }
-        }
-        create_dir_all(&root)?;
+    fn docs(&self) -> String {
+        hide_code_block_lines(self.item.docs.as_deref().unwrap_or(""))
+    }
 
+    fn associated_methods(&self) -> Vec<Self> {
+        match &self.item.inner {
+            ItemEnum::Struct(s) => s
+                .impls
+                .iter()
+                .filter_map(|id| self.pkg.index.get(id))
+                .filter_map(|item| match &item.inner {
+                    ItemEnum::Impl(impl_) => match impl_.trait_ {
+                        Some(_) => None,
+                        None => Some(impl_.items.as_slice()),
+                    },
+                    _ => None,
+                })
+                .flatten()
+                .flat_map(|id| self.pkg.index.get(id).map(|item| (id, item)))
+                .map(|(_, item)| {
+                    Self::new(
+                        self.pkg,
+                        item,
+                        Summary::Path(self.path().join(self.item.name.as_deref().unwrap_or(""))),
+                    )
+                })
+                .collect(),
+            _ => vec![],
+        }
+    }
+
+    fn write_md(&self, root: &Path) -> Result<(), Error> {
+        let root = PathBuf::from(root).join(self.path());
+        let root = root.parent().unwrap();
+        create_dir_all(root)?;
         let filename = root.join(format!("{}.md", self.name()));
 
-        let mut file = File::create(&filename)?;
-        file.write_all(self.to_string().as_bytes())?;
-        if let SegmentType::StructItem(item) = self.type_ {
-            for method in extract_associated_methods(self.crate_, item) {
-                self.extract(SegmentType::FunctionItem(method))
-                    .write_md(&filename.parent().unwrap().join(self.name()))?;
-            }
-        }
+        let mut file = File::create(filename)?;
+        file.write_all(self.repr().as_bytes())?;
         Ok(())
-    }
-
-    fn _item(&self) -> &Item {
-        match self.type_ {
-            SegmentType::StructItem(s) => s,
-            SegmentType::FunctionItem(f) => f,
-            _ => panic!("Invalid type: {:?}", self.type_),
-        }
-    }
-
-    pub fn name(&self) -> &str {
-        self._item().name.as_deref().unwrap_or("")
-    }
-
-    fn _docs(&self) -> &str {
-        self._item().docs.as_deref().unwrap_or("")
-    }
-
-    pub fn docs(&self) -> String {
-        hide_code_block_lines(self._docs())
-    }
-
-    pub fn caption(&self) -> &str {
-        let re = RegexBuilder::new(r"(?:^\s*\n*)*(?P<caption>^\w*.*)(?:\n?)$?")
-            .multi_line(true)
-            .build()
-            .unwrap();
-
-        re.captures(self._docs())
-            .map(|cap| cap.name("caption").map(|m| m.as_str()).unwrap_or(""))
-            .unwrap_or("")
     }
 }
 
-impl<'a> std::fmt::Display for Segment<'a> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self.type_ {
-            SegmentType::Empty => {
-                write!(f, "")
-            }
+trait Repr<'a> {
+    fn repr(&self) -> String;
+}
 
-            SegmentType::FunctionItem(item) => {
+impl<'a> Repr<'a> for ItemRef<'a> {
+    fn repr(&self) -> String {
+        match self.kind() {
+            ItemKind::Function => {
                 let name = self.name();
-                write!(
-                    f,
-                    r#"
-# {}
+                format!(
+                    r#"# {}
 
 <dl>
     <dt class="sig">
@@ -270,89 +229,82 @@ impl<'a> std::fmt::Display for Segment<'a> {
 "#,
                     name,
                     name,
-                    self.extract(SegmentType::ItemEnum(&item.inner)),
+                    self.item.inner.repr(),
                     self.docs()
                 )
             }
 
-            SegmentType::StructItem(item) => {
-                write!(f, "# {}\n\n{}", self.name(), self.docs(),)?;
-
-                let methods = extract_associated_methods(self.crate_, item)
+            ItemKind::Struct => {
+                let methods = associated_methods(self.pkg, self.item)
                     .into_iter()
-                    .map(|item| self.extract(SegmentType::FunctionItem(item)))
                     .map(|method| {
                         format!(
-                            "| [{}]({}/{}.md) | {} |",
-                            method.name(),
-                            self.name(),
-                            method.name(),
-                            method.caption()
+                            "| {} | {} |",
+                            method.name.as_deref().unwrap(),
+                            caption(method)
                         )
                     })
                     .collect::<Vec<String>>()
                     .join("\n");
 
                 if !methods.is_empty() {
-                    write!(
-                        f,
-                        "\n\n# Methods\n| Method | Description |\n| --- | --- |\n{}",
+                    format!(
+                        "# {}\n\n{}\n\n# Methods\n| Method | Description |\n| --- | --- |\n{}",
+                        self.name(),
+                        self.docs(),
                         methods
-                    )?
-                };
-
-                Ok(())
+                    )
+                } else {
+                    format!("# {}\n\n{}", self.name(), self.docs())
+                }
             }
 
-            SegmentType::ItemEnum(item) => match item {
-                ItemEnum::Function(func) => {
-                    write!(
-                        f,
-                        r#"<span class="sig-paren">(</span>
+            _ => unimplemented!("Unimplemented ItemKind: {:?}", self),
+        }
+    }
+}
+
+impl<'a> Repr<'a> for ItemEnum {
+    fn repr(&self) -> String {
+        match self {
+            ItemEnum::Function(func) => {
+                format!(
+                    r#"<span class="sig-paren">(</span>
 {}
 <span class="sig-paren">)</span>
 {}"#,
-                        func.decl
-                            .inputs
-                            .iter()
-                            .map(|(n, t)| format!(
-                                r#"<em class="sig-param n">
+                    func.decl
+                        .inputs
+                        .iter()
+                        .map(|(n, t)| format!(
+                            r#"<em class="sig-param n">
     <span class="pre">{}</span>: <span class="pre">{}</span>
 </em>"#,
-                                n,
-                                self.extract(SegmentType::Type(t))
-                            ))
-                            .collect::<Vec<String>>()
-                            .join(", "),
-                        func.decl
-                            .output
-                            .as_ref()
-                            .map(|t| format!(" → {}", self.extract(SegmentType::Type(t))))
-                            .unwrap_or("".to_string())
-                    )
-                }
-
-                _ => unimplemented!("Unimplemented item: {:?}", item),
-            },
-
-            SegmentType::ResolvedPath(p) => write!(
-                f,
-                "{}{}",
-                p.name,
-                p.args
-                    .as_ref()
-                    .map(|args| self.extract(SegmentType::GenericArgs(args)).to_string())
-                    .unwrap_or("".to_string())
-            ),
-
-            SegmentType::Type(Type::Primitive(p)) => write!(f, "{}", p),
-
-            SegmentType::Type(Type::ResolvedPath(p)) => {
-                write!(f, "{}", self.extract(SegmentType::ResolvedPath(p)))
+                            n,
+                            t.repr()
+                        ))
+                        .collect::<Vec<String>>()
+                        .join(", "),
+                    func.decl
+                        .output
+                        .as_ref()
+                        .map(|t| format!(" → {}", t.repr()))
+                        .unwrap_or("".to_string())
+                )
             }
+            _ => unimplemented!("Unimplemented ItemEnum: {:?}", self),
+        }
+    }
+}
 
-            SegmentType::Type(Type::DynTrait(dyn_trait)) => write!(
-                f,
+impl<'a> Repr<'a> for Type {
+    fn repr(&self) -> String {
+        match self {
+            Type::Primitive(p) => p.clone(),
+
+            Type::ResolvedPath(p) => p.repr(),
+
+            Type::DynTrait(dyn_trait) => format!(
                 "dyn {}",
                 dyn_trait
                     .traits
@@ -365,7 +317,7 @@ impl<'a> std::fmt::Display for Segment<'a> {
                             } else {
                                 ""
                             },
-                            self.extract(SegmentType::ResolvedPath(&poly_trait.trait_))
+                            &poly_trait.trait_.repr()
                         )
                     })
                     .chain(dyn_trait.lifetime.iter().map(|t| t.to_string()))
@@ -373,134 +325,140 @@ impl<'a> std::fmt::Display for Segment<'a> {
                     .join(" + ")
             ),
 
-            SegmentType::Type(Type::Generic(t)) => write!(f, "{}", &t),
+            Type::Generic(t) => t.clone(),
 
-            SegmentType::Type(Type::BorrowedRef {
+            Type::BorrowedRef {
                 lifetime,
                 mutable,
                 type_,
-            }) => {
-                write!(
-                    f,
+            } => {
+                format!(
                     "&{}{}{}",
                     lifetime
                         .as_ref()
                         .map(|a| format!("{} ", a))
                         .unwrap_or("".to_string()),
                     if *mutable { "mut " } else { "" },
-                    self.extract(SegmentType::Type(type_))
+                    type_.repr()
                 )
             }
 
-            SegmentType::Type(Type::Tuple(tuple)) => write!(
-                f,
+            Type::Tuple(tuple) => format!(
                 "({})",
                 tuple
                     .iter()
-                    .map(|t| self.extract(SegmentType::Type(t)).to_string())
+                    .map(|t| t.repr())
                     .collect::<Vec<String>>()
                     .join(", ")
             ),
 
-            SegmentType::Type(Type::Slice(slice)) => {
-                write!(f, "[{}]", self.extract(SegmentType::Type(slice)))
-            }
+            Type::Slice(slice) => format!("[{}]", slice.repr()),
 
-            SegmentType::Type(Type::Array { type_, len }) => {
-                write!(f, "[{}: {}]", self.extract(SegmentType::Type(type_)), len)
-            }
+            Type::Array { type_, len } => format!("[{}: {}]", type_.repr(), len),
 
-            SegmentType::Type(Type::ImplTrait(bounds)) => {
-                write!(
-                    f,
+            Type::ImplTrait(bounds) => {
+                format!(
                     "impl {}",
                     bounds
                         .iter()
-                        .map(|b| self.extract(SegmentType::GenericBound(b)).to_string())
+                        .map(|b| b.repr())
                         .collect::<Vec<String>>()
                         .join(" + ")
                 )
             }
 
-            SegmentType::Type(unknown) => unimplemented!("Unimplemented Type: {:?}", unknown),
+            unknown => unimplemented!("Unimplemented Type: {:?}", unknown),
+        }
+    }
+}
 
-            SegmentType::GenericArgs(GenericArgs::AngleBracketed { args, bindings }) => {
+impl<'a> Repr<'a> for TypeBinding {
+    fn repr(&self) -> String {
+        format!(
+            "{}{}{}",
+            self.name,
+            self.args.repr(),
+            match &self.binding {
+                TypeBindingKind::Equality(term) => {
+                    match term {
+                        Term::Type(t) => t.repr(),
+                        Term::Constant(c) => {
+                            unimplemented!("Unimplemented TypeBindingKind: {:?}", c)
+                        }
+                    }
+                }
+                TypeBindingKind::Constraint(c) =>
+                    unimplemented!("Unimplemented TypeBindingKing: {:?}", c),
+            }
+        )
+    }
+}
+
+impl<'a> Repr<'a> for GenericArgs {
+    fn repr(&self) -> String {
+        match self {
+            GenericArgs::AngleBracketed { args, bindings } => {
                 if !args.is_empty() || !bindings.is_empty() {
-                    write!(
-                        f,
+                    format!(
                         "&lt;{}&gt;",
                         args.iter()
                             .map(|arg| match arg {
                                 GenericArg::Lifetime(a) => a.clone(),
-                                GenericArg::Type(t) =>
-                                    self.extract(SegmentType::Type(t)).to_string(),
+                                GenericArg::Type(t) => t.repr(),
                                 unknown =>
                                     unimplemented!("Unimplemented GenericArg: {:?}", unknown),
                             })
-                            .chain(bindings.iter().map(|binding| {
-                                self.extract(SegmentType::TypeBinding(binding)).to_string()
-                            }))
+                            .chain(bindings.iter().map(|binding| { binding.repr() }))
                             .collect::<Vec<String>>()
                             .join(", ")
                     )
                 } else {
-                    write!(f, "")
+                    "".to_string()
                 }
             }
+            _ => unimplemented!("Unimplemented GenericArgs: {:?}", self),
+        }
+    }
+}
 
-            SegmentType::GenericArgs(unknown) => {
-                unimplemented!("Unimplemented GenericArgs: {:?}", unknown)
-            }
+impl<'a> Repr<'a> for rustdoc_types::Path {
+    fn repr(&self) -> String {
+        format!(
+            "{}{}",
+            self.name,
+            self.args
+                .as_ref()
+                .map(|args| args.repr())
+                .unwrap_or("".to_string())
+        )
+    }
+}
 
-            SegmentType::GenericBound(b) => match b {
-                GenericBound::TraitBound {
-                    trait_,
-                    generic_params,
-                    modifier,
-                } => {
-                    write!(
-                        f,
-                        "{}{}{}",
-                        if !generic_params.is_empty() {
-                            unimplemented!("Unimplemented: Higher-Rank Trait Bounds")
-                        } else {
-                            ""
-                        },
+impl<'a> Repr<'a> for GenericBound {
+    fn repr(&self) -> String {
+        match self {
+            GenericBound::TraitBound {
+                trait_,
+                generic_params,
+                modifier,
+            } => {
+                if !generic_params.is_empty() {
+                    unimplemented!("Unimplemented: Higher-Rank Trait Bounds")
+                } else {
+                    format!(
+                        "{}{}",
                         match modifier {
                             TraitBoundModifier::None => "",
                             TraitBoundModifier::Maybe => "?",
                             TraitBoundModifier::MaybeConst => {
-                                unimplemented!("Unimplemented TraitBoundModifier: {:?}", b)
+                                unimplemented!("Unimplemented TraitBoundModifier: {:?}", self)
                             }
                         },
-                        self.extract(SegmentType::ResolvedPath(trait_))
+                        trait_.repr()
                     )
                 }
-                GenericBound::Outlives(a) => write!(f, "{}", a),
-            },
-
-            SegmentType::TypeBinding(TypeBinding {
-                name,
-                args,
-                binding,
-            }) => write!(
-                f,
-                "{}{}{}",
-                name,
-                self.extract(SegmentType::GenericArgs(args)),
-                match binding {
-                    TypeBindingKind::Equality(term) => {
-                        match term {
-                            Term::Type(t) => self.extract(SegmentType::Type(t)),
-                            Term::Constant(c) => {
-                                unimplemented!("Unimplemented TypeBindingKind: {:?}", c)
-                            }
-                        }
-                    }
-                    TypeBindingKind::Constraint(c) =>
-                        unimplemented!("Unimplemented TypeBindingKing: {:?}", c),
-                }
-            ),
+            }
+            GenericBound::Outlives(a) => a.to_string(),
         }
     }
 }

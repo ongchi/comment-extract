@@ -18,7 +18,7 @@
 use regex::RegexBuilder;
 use rustdoc_types::{Crate, Item, ItemEnum};
 
-pub fn extract_associated_methods<'a>(crate_: &'a Crate, item: &'a Item) -> Vec<&'a Item> {
+pub fn associated_methods<'a>(crate_: &'a Crate, item: &'a Item) -> Vec<&'a Item> {
     match &item.inner {
         ItemEnum::Struct(s) => s
             .impls
@@ -36,6 +36,22 @@ pub fn extract_associated_methods<'a>(crate_: &'a Crate, item: &'a Item) -> Vec<
             .collect(),
         _ => panic!("Not a struct: {:?}", item),
     }
+}
+
+pub fn caption(item: &Item) -> String {
+    let re = RegexBuilder::new(r"(?:^\s*\n*)*(?P<caption>^\w*.*)(?:\n?)$?")
+        .multi_line(true)
+        .build()
+        .unwrap();
+
+    item.docs
+        .as_ref()
+        .and_then(|docs| {
+            re.captures(docs)
+                .map(|cap| cap.name("caption").map(|m| m.as_str()).unwrap_or(""))
+        })
+        .unwrap_or("")
+        .to_string()
 }
 
 // Remove lines starts with `#` in code blocks
