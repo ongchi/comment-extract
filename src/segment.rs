@@ -15,15 +15,141 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::collections::HashMap;
 use std::fs::{create_dir_all, File};
-use std::io::Write;
+use std::io::{BufReader, Write};
 use std::path::{Path, PathBuf};
 
+use anyhow::{anyhow, Error};
 use regex::RegexBuilder;
 use rustdoc_types::{
-    Crate, GenericArg, GenericArgs, GenericBound, Id, Item, ItemEnum, Term, TraitBoundModifier,
-    Type, TypeBinding, TypeBindingKind,
+    Crate, GenericArg, GenericArgs, GenericBound, Item, ItemEnum, ItemKind, Term,
+    TraitBoundModifier, Type, TypeBinding, TypeBindingKind, Visibility,
 };
+
+use crate::utils::{extract_associated_methods, hide_code_block_lines};
+use crate::Args;
+
+#[derive(Debug)]
+pub struct ExportOption {
+    package: String,
+    module_path: Option<PathBuf>,
+    kind: ItemKind,
+}
+
+#[derive(Debug)]
+pub struct SegmentCollections {
+    packages: HashMap<String, Crate>,
+    export_options: Vec<ExportOption>,
+    output_root: PathBuf,
+}
+
+impl<'a> SegmentCollections {
+    fn _items_to_export(&'a self) -> Result<Vec<ExportItem<'a>>, Error> {
+        let mut items = vec![];
+
+        for option in &self.export_options {
+            let crate_ = self.packages.get(&option.package).unwrap();
+            items.extend(
+                crate_
+                    .paths
+                    .iter()
+                    .filter(|(_, summary)| summary.kind == option.kind)
+                    .filter(|(_, summary)| {
+                        if let Some(selected_path) = &option.module_path {
+                            let this_path = summary.path.iter().collect::<PathBuf>();
+                            this_path.ancestors().any(|p| p == selected_path)
+                        } else {
+                            true
+                        }
+                    })
+                    .filter_map(|(id, _)| match crate_.index.get(id) {
+                        Some(item) => {
+                            if item.visibility == Visibility::Public {
+                                let export_item = match option.kind {
+                                    ItemKind::Function => ExportItem::Function { crate_, item },
+                                    ItemKind::Struct => ExportItem::Struct { crate_, item },
+                                    _ => unimplemented!("unsupported item kind: {:?}", option.kind),
+                                };
+                                Some((id.clone(), export_item))
+                            } else {
+                                None
+                            }
+                        }
+                        None => None,
+                    })
+                    .map(|(_, item)| item),
+            );
+        }
+
+        Ok(items)
+    }
+
+    pub fn export(&'a self) -> Result<(), Error> {
+        let output_root: PathBuf = self.output_root.clone();
+
+        for item in self._items_to_export()? {
+            match item {
+                ExportItem::Function { crate_, item } => Segment::new(crate_)
+                    .extract(SegmentType::FunctionItem(item))
+                    .write_md(&output_root)?,
+                ExportItem::Struct { crate_, item } => Segment::new(crate_)
+                    .extract(SegmentType::StructItem(item))
+                    .write_md(&output_root)?,
+            }
+        }
+
+        Ok(())
+    }
+}
+
+impl TryFrom<Args> for SegmentCollections {
+    type Error = Error;
+
+    fn try_from(value: Args) -> Result<Self, Self::Error> {
+        let mut builder = rustdoc_json::Builder::default()
+            .manifest_path(&value.manifest_path)
+            .toolchain("nightly")
+            .all_features(true)
+            .clear_target_dir();
+
+        if let Some(pkg) = &value.package {
+            builder = builder.package(pkg);
+        }
+
+        let json_path = builder.build()?;
+        let file = File::open(json_path).map_err(|e| anyhow!(e))?;
+        let reader = BufReader::new(file);
+        let crate_: Crate = serde_json::from_reader(reader)?;
+
+        let package = match value.package {
+            Some(pkg) => pkg,
+            None => crate_
+                .index
+                .get(&crate_.root)
+                .and_then(|item| item.name.clone())
+                .unwrap(),
+        };
+
+        let packages = [(package.clone(), crate_)].into_iter().collect();
+
+        Ok(Self {
+            packages,
+            export_options: vec![ExportOption {
+                package,
+                module_path: value.module_path.map(|s| s.split("::").collect()),
+                kind: serde_plain::from_str(&value.kind)?,
+            }],
+            output_root: PathBuf::from(value.output_path),
+        })
+    }
+}
+
+#[derive(Debug)]
+pub enum ExportItem<'a> {
+    Function { crate_: &'a Crate, item: &'a Item },
+    Struct { crate_: &'a Crate, item: &'a Item },
+}
 
 pub struct Segment<'a> {
     crate_: &'a Crate,
@@ -53,7 +179,7 @@ impl<'a> Segment<'a> {
 
     pub fn extract(&self, type_: SegmentType<'a>) -> Self {
         Self {
-            crate_: &self.crate_,
+            crate_: self.crate_,
             type_,
         }
     }
@@ -76,15 +202,11 @@ impl<'a> Segment<'a> {
 
         let mut file = File::create(&filename)?;
         file.write_all(self.to_string().as_bytes())?;
-        match self.type_ {
-            SegmentType::StructItem(_) => {
-                for mid in self.method_ids() {
-                    let method = self.crate_.index.get(&mid).unwrap();
-                    self.extract(SegmentType::FunctionItem(method))
-                        .write_md(&filename.parent().unwrap().join(self.name()))?;
-                }
+        if let SegmentType::StructItem(item) = self.type_ {
+            for method in extract_associated_methods(self.crate_, item) {
+                self.extract(SegmentType::FunctionItem(method))
+                    .write_md(&filename.parent().unwrap().join(self.name()))?;
             }
-            _ => {}
         }
         Ok(())
     }
@@ -98,11 +220,11 @@ impl<'a> Segment<'a> {
     }
 
     pub fn name(&self) -> &str {
-        self._item().name.as_ref().map(|s| s.as_str()).unwrap_or("")
+        self._item().name.as_deref().unwrap_or("")
     }
 
     fn _docs(&self) -> &str {
-        self._item().docs.as_ref().map(|s| s.as_str()).unwrap_or("")
+        self._item().docs.as_deref().unwrap_or("")
     }
 
     pub fn docs(&self) -> String {
@@ -115,31 +237,9 @@ impl<'a> Segment<'a> {
             .build()
             .unwrap();
 
-        re.captures(&self._docs())
+        re.captures(self._docs())
             .map(|cap| cap.name("caption").map(|m| m.as_str()).unwrap_or(""))
             .unwrap_or("")
-    }
-
-    fn method_ids(&self) -> Vec<Id> {
-        match self.type_ {
-            SegmentType::StructItem(item) => match &item.inner {
-                ItemEnum::Struct(s) => s
-                    .impls
-                    .iter()
-                    .filter_map(|id| self.crate_.index.get(id))
-                    .filter_map(|item| match &item.inner {
-                        ItemEnum::Impl(impl_) => match impl_.trait_ {
-                            Some(_) => None,
-                            None => Some(impl_.items.clone()),
-                        },
-                        _ => None,
-                    })
-                    .flatten()
-                    .collect(),
-                _ => panic!("Not a struct: {:?}", self.type_),
-            },
-            _ => panic!("Not a struct: {:?}", self.type_),
-        }
     }
 }
 
@@ -175,13 +275,11 @@ impl<'a> std::fmt::Display for Segment<'a> {
                 )
             }
 
-            SegmentType::StructItem(_) => {
+            SegmentType::StructItem(item) => {
                 write!(f, "# {}\n\n{}", self.name(), self.docs(),)?;
 
-                let methods = self
-                    .method_ids()
-                    .iter()
-                    .map(|id| self.crate_.index.get(id).unwrap())
+                let methods = extract_associated_methods(self.crate_, item)
+                    .into_iter()
                     .map(|item| self.extract(SegmentType::FunctionItem(item)))
                     .map(|method| {
                         format!(
@@ -262,7 +360,7 @@ impl<'a> std::fmt::Display for Segment<'a> {
                     .map(|poly_trait| {
                         format!(
                             "{}{}",
-                            if poly_trait.generic_params.len() > 0 {
+                            if !poly_trait.generic_params.is_empty() {
                                 unimplemented!("Unimplemented: Higher-Rank Trait Bounds")
                             } else {
                                 ""
@@ -324,10 +422,10 @@ impl<'a> std::fmt::Display for Segment<'a> {
                 )
             }
 
-            SegmentType::Type(unknown @ _) => unimplemented!("Unimplemented Type: {:?}", unknown),
+            SegmentType::Type(unknown) => unimplemented!("Unimplemented Type: {:?}", unknown),
 
             SegmentType::GenericArgs(GenericArgs::AngleBracketed { args, bindings }) => {
-                if args.len() > 0 || bindings.len() > 0 {
+                if !args.is_empty() || !bindings.is_empty() {
                     write!(
                         f,
                         "&lt;{}&gt;",
@@ -336,7 +434,7 @@ impl<'a> std::fmt::Display for Segment<'a> {
                                 GenericArg::Lifetime(a) => a.clone(),
                                 GenericArg::Type(t) =>
                                     self.extract(SegmentType::Type(t)).to_string(),
-                                unknown @ _ =>
+                                unknown =>
                                     unimplemented!("Unimplemented GenericArg: {:?}", unknown),
                             })
                             .chain(bindings.iter().map(|binding| {
@@ -350,7 +448,7 @@ impl<'a> std::fmt::Display for Segment<'a> {
                 }
             }
 
-            SegmentType::GenericArgs(unknown @ _) => {
+            SegmentType::GenericArgs(unknown) => {
                 unimplemented!("Unimplemented GenericArgs: {:?}", unknown)
             }
 
@@ -363,7 +461,7 @@ impl<'a> std::fmt::Display for Segment<'a> {
                     write!(
                         f,
                         "{}{}{}",
-                        if generic_params.len() > 0 {
+                        if !generic_params.is_empty() {
                             unimplemented!("Unimplemented: Higher-Rank Trait Bounds")
                         } else {
                             ""
@@ -405,61 +503,4 @@ impl<'a> std::fmt::Display for Segment<'a> {
             ),
         }
     }
-}
-
-// Remove lines starts with `#` in code blocks
-fn hide_code_block_lines(docs: &str) -> String {
-    let re_code = RegexBuilder::new(r"^```(?<rust_code>(rust(\s*|\s+.*)?)|\s*)?$")
-        .build()
-        .unwrap();
-    let re_show = RegexBuilder::new(r"^[^#].*|^#\[.*").build().unwrap();
-
-    enum Status {
-        InRustCodeBlock,
-        InCodeBlock,
-        NotInCodeBlock,
-    }
-
-    let mut filtered_docs: Vec<&str> = Vec::new();
-    let mut stat = Status::NotInCodeBlock;
-
-    for line in docs.lines() {
-        match stat {
-            Status::InRustCodeBlock => {
-                if let Some(_) = re_show.captures(line) {
-                    filtered_docs.push(line);
-                }
-                if let Some(_) = re_code.captures(line) {
-                    stat = Status::NotInCodeBlock;
-                }
-            }
-            Status::InCodeBlock => {
-                filtered_docs.push(line);
-                if let Some(_) = re_code.captures(line) {
-                    stat = Status::NotInCodeBlock;
-                }
-            }
-            Status::NotInCodeBlock => {
-                if let Some(cap) = re_code.captures(line) {
-                    stat = match cap.name("rust_code") {
-                        Some(_) => {
-                            // The rustdoc code blocks without specifyinig a language would be `rust`, and
-                            // may contain additional attributes.
-                            // Replace with this line to work with Sphinix.
-                            filtered_docs.push("```rust");
-                            Status::InRustCodeBlock
-                        }
-                        _ => {
-                            filtered_docs.push(line);
-                            Status::InCodeBlock
-                        }
-                    };
-                } else {
-                    filtered_docs.push(line);
-                };
-            }
-        }
-    }
-
-    filtered_docs.join("\n")
 }
