@@ -22,23 +22,24 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Error};
 use rustdoc_types::{
-    Crate, GenericArg, GenericArgs, GenericBound, Item, ItemEnum, ItemKind, ItemSummary, Term,
-    TraitBoundModifier, Type, TypeBinding, TypeBindingKind, Visibility,
+    Crate, GenericArg, GenericArgs, GenericBound, Id, Item, ItemEnum, ItemKind, ItemSummary, Term,
+    TraitBoundModifier, Type, TypeBinding, TypeBindingKind,
 };
 
-use crate::utils::{caption, hide_code_block_lines};
-use crate::Config;
+use crate::doc_traits::{CrossRef, ModulePath, Name, RelativeTo, Repr};
+use crate::utils::{associated_methods, caption, hide_code_block_lines};
+use crate::{Config, Package};
 
 #[derive(Debug)]
 pub struct ExportOption {
-    package: String,
+    package: Package,
     module_path: Option<PathBuf>,
     kind: ItemKind,
 }
 
 #[derive(Debug)]
 pub struct SegmentCollections {
-    packages: HashMap<String, Crate>,
+    pool: HashMap<String, Crate>,
     export_options: Vec<ExportOption>,
     output_root: PathBuf,
 }
@@ -48,24 +49,27 @@ impl<'a> SegmentCollections {
         let mut items = vec![];
 
         for option in &self.export_options {
-            let crate_ = self.packages.get(&option.package).unwrap();
+            let crate_ = self.pool.get(&option.package.name).unwrap();
+
             items.extend(
-                (crate_.paths.iter())
-                    .filter(|(_, summ)| summ.kind == option.kind)
-                    .filter(|(_, summ)| {
+                crate_
+                    .index
+                    .keys()
+                    .filter(|id| crate_.paths.get(id).map(|_| true).unwrap_or(false))
+                    .map(|id| ItemRef::new(&self.pool, &option.package.name, id, None))
+                    .filter(|item| item.kind() == option.kind)
+                    .filter(|item| {
                         option
                             .module_path
                             .as_ref()
-                            .map(|p| summ.path.iter().collect::<PathBuf>().starts_with(p))
+                            .map(|p| item.path().starts_with(p))
                             .unwrap_or(true)
                     })
-                    .filter_map(|(id, summ)| crate_.index.get(id).map(|item| (id, item, summ)))
-                    .filter(|(_, item, _)| item.visibility == Visibility::Public)
-                    .flat_map(|(_, item, item_summary)| {
-                        let root = ItemRef::new(crate_, item, Summary::ItemSummary(item_summary));
-                        root.associated_methods().into_iter().chain([root])
+                    .flat_map(|item| {
+                        let methods = associated_methods(&self.pool, &option.package.name, item.id);
+                        methods.into_iter().chain([item])
                     }),
-            );
+            )
         }
 
         Ok(items)
@@ -90,11 +94,11 @@ impl TryFrom<Config> for SegmentCollections {
         let mut packages = HashMap::new();
         let mut export_options = vec![];
 
-        for pkg in value.packages {
-            if packages.get(&pkg.name).is_none() {
+        for package in value.packages {
+            if packages.get(&package.name).is_none() {
                 let builder = rustdoc_json::Builder::default()
                     .manifest_path(manifest_path)
-                    .package(&pkg.name)
+                    .package(&package.name)
                     .toolchain("nightly")
                     .all_features(true)
                     .clear_target_dir();
@@ -104,18 +108,24 @@ impl TryFrom<Config> for SegmentCollections {
                 let reader = BufReader::new(file);
                 let crate_: Crate = serde_json::from_reader(reader)?;
 
-                packages.insert(pkg.name.clone(), crate_);
+                packages.insert(package.name.clone(), crate_);
             }
 
+            let kind = serde_plain::from_str(&package.kind)?;
+            let module_path = package
+                .module_path
+                .as_deref()
+                .map(|s| s.split("::").collect());
+
             export_options.push(ExportOption {
-                package: pkg.name,
-                module_path: pkg.module_path.map(|s| s.split("::").collect()),
-                kind: serde_plain::from_str(&pkg.kind)?,
+                package,
+                module_path,
+                kind,
             });
         }
 
         Ok(Self {
-            packages,
+            pool: packages,
             export_options,
             output_root,
         })
@@ -124,76 +134,61 @@ impl TryFrom<Config> for SegmentCollections {
 
 // Save necessory information for associated function of a struct
 // which does not have an ItemSummary.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum Summary<'a> {
     ItemSummary(&'a ItemSummary),
     Path(PathBuf),
 }
 
-trait DocName {
-    fn name(&self) -> &str;
-}
-
-trait DocPath {
-    fn path(&self) -> PathBuf;
-}
-
-pub trait RelativeTo<'a, T> {
-    fn relative_to(&'a self, other: &T) -> PathBuf;
-}
-
-trait CrossLink<T> {
-    fn cross_link(&self, _to: &T) -> String;
-}
-
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ItemRef<'a> {
-    pkg: &'a Crate,
-    item: &'a Item,
+    pool: &'a HashMap<String, Crate>,
+    pkg: &'a str,
+    id: &'a Id,
     summary: Summary<'a>,
 }
 
 impl<'a> ItemRef<'a> {
-    fn new(pkg: &'a Crate, item: &'a Item, summary: Summary<'a>) -> Self {
-        Self { pkg, item, summary }
+    pub fn new(
+        pool: &'a HashMap<String, Crate>,
+        pkg: &'a str,
+        id: &'a Id,
+        path: Option<PathBuf>,
+    ) -> Self {
+        let summary = match &pool.get(pkg).unwrap().paths.get(id) {
+            Some(summ) => Summary::ItemSummary(summ),
+            None => Summary::Path(path.unwrap()),
+        };
+
+        Self {
+            pool,
+            pkg,
+            id,
+            summary,
+        }
+    }
+
+    fn crate_(&self) -> &Crate {
+        self.pool.get(self.pkg).unwrap()
+    }
+
+    fn item(&self) -> &Item {
+        self.crate_().index.get(self.id).unwrap()
+    }
+
+    fn summary(&self) -> &Summary {
+        &self.summary
     }
 
     fn kind(&self) -> ItemKind {
-        match self.summary {
+        match self.summary() {
             Summary::ItemSummary(summ) => summ.kind.clone(),
             Summary::Path(_) => ItemKind::Function,
         }
     }
 
     fn docs(&self) -> String {
-        hide_code_block_lines(self.item.docs.as_deref().unwrap_or(""))
-    }
-
-    fn associated_methods(&self) -> Vec<Self> {
-        match &self.item.inner {
-            ItemEnum::Struct(s) => s
-                .impls
-                .iter()
-                .filter_map(|id| self.pkg.index.get(id))
-                .filter_map(|item| match &item.inner {
-                    ItemEnum::Impl(impl_) => match impl_.trait_ {
-                        Some(_) => None,
-                        None => Some(impl_.items.as_slice()),
-                    },
-                    _ => None,
-                })
-                .flatten()
-                .flat_map(|id| self.pkg.index.get(id).map(|item| (id, item)))
-                .map(|(_, item)| {
-                    Self::new(
-                        self.pkg,
-                        item,
-                        Summary::Path(self.path().join(self.item.name.as_deref().unwrap_or(""))),
-                    )
-                })
-                .collect(),
-            _ => vec![],
-        }
+        hide_code_block_lines(self.item().docs.as_deref().unwrap_or(""))
     }
 
     fn write_md(&self, root: &Path) -> Result<(), Error> {
@@ -208,15 +203,15 @@ impl<'a> ItemRef<'a> {
     }
 }
 
-impl<'a> DocName for ItemRef<'a> {
-    fn name(&self) -> &'a str {
-        self.item.name.as_deref().unwrap_or("")
+impl<'a> Name for ItemRef<'a> {
+    fn name(&self) -> &str {
+        self.item().name.as_deref().unwrap_or("")
     }
 }
 
-impl<'a> DocPath for ItemRef<'a> {
+impl<'a> ModulePath for ItemRef<'a> {
     fn path(&self) -> PathBuf {
-        match &self.summary {
+        match &self.summary() {
             Summary::ItemSummary(summ) => summ.path.iter().collect(),
             Summary::Path(p) => p.clone(),
         }
@@ -225,15 +220,11 @@ impl<'a> DocPath for ItemRef<'a> {
 
 impl<'a, T> RelativeTo<'a, T> for ItemRef<'a>
 where
-    T: DocPath,
+    T: ModulePath,
 {
     fn relative_to(&'a self, other: &T) -> PathBuf {
         self.path().relative_to(&other.path())
     }
-}
-
-trait Repr<'a> {
-    fn repr(&self) -> String;
 }
 
 impl<'a> Repr<'a> for ItemRef<'a> {
@@ -257,20 +248,19 @@ impl<'a> Repr<'a> for ItemRef<'a> {
 "#,
                     name,
                     name,
-                    &self.item.inner.repr(),
+                    &self.item().inner.repr(),
                     self.docs()
                 )
             }
 
             ItemKind::Struct => {
-                let methods = self
-                    .associated_methods()
+                let methods = associated_methods(self.pool, self.pkg, self.id)
                     .into_iter()
                     .map(|method| {
                         format!(
                             "| {} | {} |",
-                            self.cross_link(&method),
-                            caption(method.item)
+                            self.cross_ref_md(&method),
+                            caption(method.item())
                         )
                     })
                     .collect::<Vec<String>>()
@@ -290,22 +280,6 @@ impl<'a> Repr<'a> for ItemRef<'a> {
 
             _ => unimplemented!("Unimplemented ItemKind: {:?}", self),
         }
-    }
-}
-
-impl<'a, T> CrossLink<T> for ItemRef<'a>
-where
-    T: DocName + DocPath,
-{
-    fn cross_link(&self, to: &T) -> String {
-        format!(
-            "[{}]({})",
-            &to.name(),
-            self.relative_to(to)
-                .join(format!("{}.md", to.name()))
-                .to_str()
-                .unwrap()
-        )
     }
 }
 

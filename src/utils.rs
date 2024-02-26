@@ -16,15 +16,52 @@
 // under the License.
 
 use std::{
+    collections::HashMap,
     ffi::OsStr,
     iter::zip,
     path::{Path, PathBuf},
 };
 
 use regex::RegexBuilder;
-use rustdoc_types::Item;
+use rustdoc_types::{Crate, Id, Item, ItemEnum};
 
-use crate::segment::RelativeTo;
+use crate::doc_traits::RelativeTo;
+use crate::segment::ItemRef;
+
+pub fn associated_methods<'a>(
+    pool: &'a HashMap<String, Crate>,
+    pkg: &'a str,
+    root_id: &'a Id,
+) -> Vec<ItemRef<'a>> {
+    let crate_ = pool.get(pkg).unwrap();
+    let root_item = crate_.index.get(root_id).unwrap();
+    let root_path = crate_.paths.get(root_id).map(|summ| &summ.path).unwrap();
+
+    match root_item.inner {
+        ItemEnum::Struct(ref s) => s
+            .impls
+            .iter()
+            .filter_map(|id| crate_.index.get(id))
+            .filter_map(|item| match item.inner {
+                ItemEnum::Impl(ref impl_) => match impl_.trait_ {
+                    Some(_) => None,
+                    None => Some(&impl_.items),
+                },
+                _ => None,
+            })
+            .flatten()
+            .map(|id| {
+                ItemRef::new(
+                    pool,
+                    pkg,
+                    id,
+                    Some(PathBuf::from_iter(root_path).join(root_item.name.as_deref().unwrap())),
+                )
+            })
+            .collect(),
+        _ => vec![],
+    }
+}
 
 pub fn caption(item: &Item) -> String {
     let re = RegexBuilder::new(r"(?:^\s*\n*)*(?P<caption>^\w*.*)(?:\n?)$?")
