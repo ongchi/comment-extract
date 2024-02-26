@@ -26,7 +26,7 @@ use rustdoc_types::{
     TraitBoundModifier, Type, TypeBinding, TypeBindingKind, Visibility,
 };
 
-use crate::utils::{associated_methods, caption, hide_code_block_lines};
+use crate::utils::{caption, hide_code_block_lines};
 use crate::Config;
 
 #[derive(Debug)]
@@ -130,6 +130,22 @@ enum Summary<'a> {
     Path(PathBuf),
 }
 
+trait DocName {
+    fn name(&self) -> &str;
+}
+
+trait DocPath {
+    fn path(&self) -> PathBuf;
+}
+
+pub trait RelativeTo<'a, T> {
+    fn relative_to(&'a self, other: &T) -> PathBuf;
+}
+
+trait CrossLink<T> {
+    fn cross_link(&self, _to: &T) -> String;
+}
+
 #[derive(Debug)]
 pub struct ItemRef<'a> {
     pkg: &'a Crate,
@@ -142,21 +158,10 @@ impl<'a> ItemRef<'a> {
         Self { pkg, item, summary }
     }
 
-    fn name(&self) -> &'a str {
-        self.item.name.as_deref().unwrap_or("")
-    }
-
     fn kind(&self) -> ItemKind {
         match self.summary {
             Summary::ItemSummary(summ) => summ.kind.clone(),
             Summary::Path(_) => ItemKind::Function,
-        }
-    }
-
-    fn path(&self) -> PathBuf {
-        match &self.summary {
-            Summary::ItemSummary(summ) => summ.path.iter().collect(),
-            Summary::Path(p) => p.clone(),
         }
     }
 
@@ -203,6 +208,30 @@ impl<'a> ItemRef<'a> {
     }
 }
 
+impl<'a> DocName for ItemRef<'a> {
+    fn name(&self) -> &'a str {
+        self.item.name.as_deref().unwrap_or("")
+    }
+}
+
+impl<'a> DocPath for ItemRef<'a> {
+    fn path(&self) -> PathBuf {
+        match &self.summary {
+            Summary::ItemSummary(summ) => summ.path.iter().collect(),
+            Summary::Path(p) => p.clone(),
+        }
+    }
+}
+
+impl<'a, T> RelativeTo<'a, T> for ItemRef<'a>
+where
+    T: DocPath,
+{
+    fn relative_to(&'a self, other: &T) -> PathBuf {
+        self.path().relative_to(&other.path())
+    }
+}
+
 trait Repr<'a> {
     fn repr(&self) -> String;
 }
@@ -228,19 +257,20 @@ impl<'a> Repr<'a> for ItemRef<'a> {
 "#,
                     name,
                     name,
-                    self.item.inner.repr(),
+                    &self.item.inner.repr(),
                     self.docs()
                 )
             }
 
             ItemKind::Struct => {
-                let methods = associated_methods(self.pkg, self.item)
+                let methods = self
+                    .associated_methods()
                     .into_iter()
                     .map(|method| {
                         format!(
                             "| {} | {} |",
-                            method.name.as_deref().unwrap(),
-                            caption(method)
+                            self.cross_link(&method),
+                            caption(method.item)
                         )
                     })
                     .collect::<Vec<String>>()
@@ -260,6 +290,22 @@ impl<'a> Repr<'a> for ItemRef<'a> {
 
             _ => unimplemented!("Unimplemented ItemKind: {:?}", self),
         }
+    }
+}
+
+impl<'a, T> CrossLink<T> for ItemRef<'a>
+where
+    T: DocName + DocPath,
+{
+    fn cross_link(&self, to: &T) -> String {
+        format!(
+            "[{}]({})",
+            &to.name(),
+            self.relative_to(to)
+                .join(format!("{}.md", to.name()))
+                .to_str()
+                .unwrap()
+        )
     }
 }
 
@@ -346,21 +392,23 @@ impl<'a> Repr<'a> for Type {
                 "({})",
                 tuple
                     .iter()
-                    .map(|t| t.repr())
+                    .map(Repr::repr)
                     .collect::<Vec<String>>()
                     .join(", ")
             ),
 
             Type::Slice(slice) => format!("[{}]", slice.repr()),
 
-            Type::Array { type_, len } => format!("[{}: {}]", type_.repr(), len),
+            Type::Array { type_, len } => {
+                format!("[{}: {}]", type_.repr(), len)
+            }
 
             Type::ImplTrait(bounds) => {
                 format!(
                     "impl {}",
                     bounds
                         .iter()
-                        .map(|b| b.repr())
+                        .map(Repr::repr)
                         .collect::<Vec<String>>()
                         .join(" + ")
                 )
@@ -376,7 +424,7 @@ impl<'a> Repr<'a> for TypeBinding {
         format!(
             "{}{}{}",
             self.name,
-            self.args.repr(),
+            &self.args.repr(),
             match &self.binding {
                 TypeBindingKind::Equality(term) => {
                     match term {
@@ -407,7 +455,7 @@ impl<'a> Repr<'a> for GenericArgs {
                                 unknown =>
                                     unimplemented!("Unimplemented GenericArg: {:?}", unknown),
                             })
-                            .chain(bindings.iter().map(|binding| { binding.repr() }))
+                            .chain(bindings.iter().map(Repr::repr))
                             .collect::<Vec<String>>()
                             .join(", ")
                     )
@@ -426,8 +474,8 @@ impl<'a> Repr<'a> for rustdoc_types::Path {
             "{}{}",
             self.name,
             self.args
-                .as_ref()
-                .map(|args| args.repr())
+                .as_deref()
+                .map(Repr::repr)
                 .unwrap_or("".to_string())
         )
     }
