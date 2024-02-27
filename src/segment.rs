@@ -26,7 +26,7 @@ use rustdoc_types::{
     TraitBoundModifier, Type, TypeBinding, TypeBindingKind,
 };
 
-use crate::doc_traits::{CrossRef, ModulePath, Name, RelativeTo, Repr};
+use crate::doc_traits::{CrossRef, ExternalLink, ItemId, ModulePath, Name, RelativeTo, Repr};
 use crate::utils::{associated_methods, caption, hide_code_block_lines};
 use crate::{Config, Package};
 
@@ -142,8 +142,8 @@ enum Summary<'a> {
 
 #[derive(Debug, Clone)]
 pub struct ItemRef<'a> {
-    pool: &'a HashMap<String, Crate>,
-    pkg: &'a str,
+    pub pool: &'a HashMap<String, Crate>,
+    pub pkg: &'a str,
     id: &'a Id,
     summary: Summary<'a>,
 }
@@ -168,7 +168,7 @@ impl<'a> ItemRef<'a> {
         }
     }
 
-    fn crate_(&self) -> &Crate {
+    pub fn crate_(&self) -> &Crate {
         self.pool.get(self.pkg).unwrap()
     }
 
@@ -198,7 +198,7 @@ impl<'a> ItemRef<'a> {
         let filename = root.join(format!("{}.md", self.name()));
 
         let mut file = File::create(filename)?;
-        file.write_all(self.repr().as_bytes())?;
+        file.write_all(self.repr(self).as_bytes())?;
         Ok(())
     }
 }
@@ -228,7 +228,7 @@ where
 }
 
 impl<'a> Repr<'a> for ItemRef<'a> {
-    fn repr(&self) -> String {
+    fn repr(&self, _root: &'a ItemRef) -> String {
         match self.kind() {
             ItemKind::Function => {
                 let name = self.name();
@@ -248,7 +248,7 @@ impl<'a> Repr<'a> for ItemRef<'a> {
 "#,
                     name,
                     name,
-                    &self.item().inner.repr(),
+                    &self.item().inner.repr(self),
                     self.docs()
                 )
             }
@@ -284,7 +284,7 @@ impl<'a> Repr<'a> for ItemRef<'a> {
 }
 
 impl<'a> Repr<'a> for ItemEnum {
-    fn repr(&self) -> String {
+    fn repr(&self, root: &'a ItemRef) -> String {
         match self {
             ItemEnum::Function(func) => {
                 format!(
@@ -300,14 +300,14 @@ impl<'a> Repr<'a> for ItemEnum {
     <span class="pre">{}</span>: <span class="pre">{}</span>
 </em>"#,
                             n,
-                            t.repr()
+                            t.repr(root)
                         ))
                         .collect::<Vec<String>>()
                         .join(", "),
                     func.decl
                         .output
                         .as_ref()
-                        .map(|t| format!(" → {}", t.repr()))
+                        .map(|t| format!(" → {}", t.repr(root)))
                         .unwrap_or("".to_string())
                 )
             }
@@ -316,12 +316,50 @@ impl<'a> Repr<'a> for ItemEnum {
     }
 }
 
-impl<'a> Repr<'a> for Type {
-    fn repr(&self) -> String {
+impl ExternalLink for Type {
+    fn external_link(&self, root: &ItemRef) -> String {
         match self {
-            Type::Primitive(p) => p.clone(),
+            Type::Primitive(p) => format!("https://doc.rust-lang.org/std/primitive.{}.html", p),
 
-            Type::ResolvedPath(p) => p.repr(),
+            Type::ResolvedPath(p) => {
+                let crate_ = root.crate_();
+                let crate_id = crate_.index.get(&p.id).map(|item| item.crate_id).unwrap();
+
+                if crate_id == 0 {
+                    let path = crate_
+                        .paths
+                        .get(&p.id)
+                        .map(|s| s.path.join("/"))
+                        .unwrap_or("".to_string());
+                    format!(
+                        "https://docs.rs/{}/{}/{}",
+                        root.pkg,
+                        crate_.crate_version.as_deref().unwrap(),
+                        path
+                    )
+                } else {
+                    let root_url = crate_
+                        .external_crates
+                        .get(&crate_id)
+                        .and_then(|c| c.html_root_url.as_deref());
+                    match root_url {
+                        Some(url) => url.to_string(),
+                        None => "".to_string(),
+                    }
+                }
+            }
+
+            _ => unimplemented!(),
+        }
+    }
+}
+
+impl<'a> Repr<'a> for Type {
+    fn repr(&self, root: &'a ItemRef) -> String {
+        match self {
+            Type::Primitive(p) => format!("<a href=\"{}\">{}</a>", self.external_link(root), p),
+
+            Type::ResolvedPath(p) => p.repr(root),
 
             Type::DynTrait(dyn_trait) => format!(
                 "dyn {}",
@@ -336,7 +374,7 @@ impl<'a> Repr<'a> for Type {
                             } else {
                                 ""
                             },
-                            &poly_trait.trait_.repr()
+                            &poly_trait.trait_.repr(root)
                         )
                     })
                     .chain(dyn_trait.lifetime.iter().map(|t| t.to_string()))
@@ -358,7 +396,7 @@ impl<'a> Repr<'a> for Type {
                         .map(|a| format!("{} ", a))
                         .unwrap_or("".to_string()),
                     if *mutable { "mut " } else { "" },
-                    type_.repr()
+                    type_.repr(root)
                 )
             }
 
@@ -366,15 +404,15 @@ impl<'a> Repr<'a> for Type {
                 "({})",
                 tuple
                     .iter()
-                    .map(Repr::repr)
+                    .map(|tpe| tpe.repr(root))
                     .collect::<Vec<String>>()
                     .join(", ")
             ),
 
-            Type::Slice(slice) => format!("[{}]", slice.repr()),
+            Type::Slice(slice) => format!("[{}]", slice.repr(root)),
 
             Type::Array { type_, len } => {
-                format!("[{}: {}]", type_.repr(), len)
+                format!("[{}: {}]", type_.repr(root), len)
             }
 
             Type::ImplTrait(bounds) => {
@@ -382,7 +420,7 @@ impl<'a> Repr<'a> for Type {
                     "impl {}",
                     bounds
                         .iter()
-                        .map(Repr::repr)
+                        .map(|bound| bound.repr(root))
                         .collect::<Vec<String>>()
                         .join(" + ")
                 )
@@ -394,15 +432,15 @@ impl<'a> Repr<'a> for Type {
 }
 
 impl<'a> Repr<'a> for TypeBinding {
-    fn repr(&self) -> String {
+    fn repr(&self, root: &'a ItemRef) -> String {
         format!(
             "{}{}{}",
             self.name,
-            &self.args.repr(),
+            &self.args.repr(root),
             match &self.binding {
                 TypeBindingKind::Equality(term) => {
                     match term {
-                        Term::Type(t) => t.repr(),
+                        Term::Type(t) => t.repr(root),
                         Term::Constant(c) => {
                             unimplemented!("Unimplemented TypeBindingKind: {:?}", c)
                         }
@@ -416,7 +454,7 @@ impl<'a> Repr<'a> for TypeBinding {
 }
 
 impl<'a> Repr<'a> for GenericArgs {
-    fn repr(&self) -> String {
+    fn repr(&self, root: &'a ItemRef) -> String {
         match self {
             GenericArgs::AngleBracketed { args, bindings } => {
                 if !args.is_empty() || !bindings.is_empty() {
@@ -425,11 +463,11 @@ impl<'a> Repr<'a> for GenericArgs {
                         args.iter()
                             .map(|arg| match arg {
                                 GenericArg::Lifetime(a) => a.clone(),
-                                GenericArg::Type(t) => t.repr(),
+                                GenericArg::Type(t) => t.repr(root),
                                 unknown =>
                                     unimplemented!("Unimplemented GenericArg: {:?}", unknown),
                             })
-                            .chain(bindings.iter().map(Repr::repr))
+                            .chain(bindings.iter().map(|bind| bind.repr(root)))
                             .collect::<Vec<String>>()
                             .join(", ")
                     )
@@ -442,21 +480,28 @@ impl<'a> Repr<'a> for GenericArgs {
     }
 }
 
+impl ItemId for rustdoc_types::Path {
+    fn id(&self) -> &Id {
+        &self.id
+    }
+}
+
 impl<'a> Repr<'a> for rustdoc_types::Path {
-    fn repr(&self) -> String {
+    fn repr(&self, root: &'a ItemRef) -> String {
         format!(
-            "{}{}",
+            "<a href=\"{}\">{}</a>{}",
+            self.external_link(root),
             self.name,
             self.args
                 .as_deref()
-                .map(Repr::repr)
+                .map(|args| args.repr(root))
                 .unwrap_or("".to_string())
         )
     }
 }
 
 impl<'a> Repr<'a> for GenericBound {
-    fn repr(&self) -> String {
+    fn repr(&self, root: &'a ItemRef) -> String {
         match self {
             GenericBound::TraitBound {
                 trait_,
@@ -475,7 +520,7 @@ impl<'a> Repr<'a> for GenericBound {
                                 unimplemented!("Unimplemented TraitBoundModifier: {:?}", self)
                             }
                         },
-                        trait_.repr()
+                        trait_.repr(root)
                     )
                 }
             }
