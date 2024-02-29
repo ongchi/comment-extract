@@ -1,15 +1,32 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
 use std::path::PathBuf;
 
 use rustdoc_types::{Id, ItemEnum};
 
-use crate::segment::ItemRef;
+use crate::segment::CachedItem;
 
 pub(crate) trait ItemId {
     fn id(&self) -> &Id;
 }
 
 pub(crate) trait Repr<'a> {
-    fn repr(&self, root: &'a ItemRef) -> String;
+    fn repr(&self, root: &'a CachedItem) -> String;
 }
 
 pub(crate) trait Name {
@@ -48,15 +65,15 @@ where
 }
 
 pub(crate) trait ExternalLink {
-    fn external_link(&self, root: &ItemRef) -> String;
+    fn external_link(&self, root: &CachedItem) -> String;
 }
 
 impl<T> ExternalLink for T
 where
     T: ItemId + std::fmt::Debug,
 {
-    fn external_link(&self, root: &ItemRef) -> String {
-        let crate_ = root.pool.get(root.pkg).unwrap();
+    fn external_link(&self, root: &CachedItem) -> String {
+        let crate_ = root.pool.get(&root.id.pkg).unwrap();
 
         if let Some(item) = crate_.index.get(self.id()) {
             match item.crate_id {
@@ -78,7 +95,7 @@ where
 
                     format!(
                         "https://docs.rs/{}/{}/{}/{}.{}.html",
-                        root.pkg,
+                        root.id.pkg,
                         crate_.crate_version.as_deref().unwrap(),
                         path,
                         match &item.inner {
