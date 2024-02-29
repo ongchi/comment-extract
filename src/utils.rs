@@ -99,7 +99,7 @@ pub fn hide_code_block_lines(docs: &str) -> String {
     filtered_docs.join("\n")
 }
 
-impl<'a, P> RelativeTo<'a, P> for Path
+impl<P> RelativeTo<P> for Path
 where
     P: AsRef<Path>,
 {

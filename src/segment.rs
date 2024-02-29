@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fs::{create_dir_all, File};
 use std::io::{BufReader, Write};
@@ -27,7 +28,6 @@ use rustdoc_types::{
     TraitBoundModifier, Type, TypeBinding, TypeBindingKind,
 };
 
-use crate::doc_traits;
 use crate::doc_traits::{CrossRef, ExternalLink, ModulePath, Name, RelativeTo, Repr};
 use crate::utils::{caption, hide_code_block_lines};
 use crate::{Config, Package};
@@ -42,11 +42,11 @@ pub struct ExportOption {
 #[derive(Debug)]
 pub struct SegmentCollections {
     output_root: PathBuf,
-    items: Vec<CachedItem>,
+    items: Vec<Rc<CachedItem>>,
 }
 
-impl<'a> SegmentCollections {
-    pub fn extract(&'a self) -> Result<(), Error> {
+impl SegmentCollections {
+    pub fn extract(&self) -> Result<(), Error> {
         for item in &self.items {
             let root = &self.output_root;
             let root = PathBuf::from(root).join(item.path());
@@ -100,12 +100,16 @@ impl TryFrom<Config> for SegmentCollections {
             });
         }
 
-        let pool = Rc::new(packages);
+        let pool = Rc::new(ItemPool {
+            crates: packages,
+            cached_items: RefCell::new(HashMap::new()),
+            extract_items: RefCell::new(vec![]),
+        });
 
         // Collect items to be extract
         let mut items = vec![];
         for option in extract_options {
-            let crate_ = pool.get(&option.package.name).unwrap();
+            let crate_ = pool.crates.get(&option.package.name).unwrap();
             items.extend(
                 crate_
                     .index
@@ -121,18 +125,57 @@ impl TryFrom<Config> for SegmentCollections {
                     })
                     .flat_map(|(id, _)| {
                         let id = ItemId::new(option.package.name.clone(), id.clone());
-                        let item = CachedItem::new(pool.clone(), id);
+                        let item = pool.clone().get(&id);
                         let methods = item.associated_methods();
                         methods.into_iter().chain([item])
                     }),
             )
         }
 
+        pool.extract_items.borrow_mut().extend(items.clone());
+
         Ok(Self { output_root, items })
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
+pub struct ItemPool {
+    pub crates: HashMap<String, Crate>,
+    cached_items: RefCell<HashMap<ItemId, Rc<CachedItem>>>,
+    extract_items: RefCell<Vec<Rc<CachedItem>>>,
+}
+
+impl ItemPool {
+    pub fn get(self: Rc<Self>, id: &ItemId) -> Rc<CachedItem> {
+        let cached_item = self.cached_items.borrow().get(id).cloned();
+
+        if let Some(cached_item) = cached_item {
+            cached_item
+        } else {
+            let item = CachedItem::new(self.clone(), id.clone());
+            self.cached_items
+                .borrow_mut()
+                .insert(id.clone(), item.clone());
+            item
+        }
+    }
+
+    pub fn insert_with_path(self: Rc<Self>, id: &ItemId, path: PathBuf) -> Rc<CachedItem> {
+        let cached_item = self.cached_items.borrow().get(id).cloned();
+
+        if let Some(cached_item) = cached_item {
+            cached_item
+        } else {
+            let item = CachedItem::new_with_path(self.clone(), id.clone(), path);
+            self.cached_items
+                .borrow_mut()
+                .insert(id.clone(), item.clone());
+            item
+        }
+    }
+}
+
+#[derive(Debug, Clone, Hash, Eq, PartialEq)]
 pub struct ItemId {
     pub pkg: String,
     pub id: Id,
@@ -146,16 +189,16 @@ impl ItemId {
 
 #[derive(Debug, Clone)]
 pub struct CachedItem {
-    pub pool: Rc<HashMap<String, Crate>>,
+    pub pool: Rc<ItemPool>,
     pub id: ItemId,
-    pub item: Item,
+    pub item: Option<Item>,
     pub item_summary: Option<ItemSummary>,
     pub path: PathBuf,
 }
 
 impl CachedItem {
-    pub fn new(pool: Rc<HashMap<String, Crate>>, id: ItemId) -> Self {
-        let item_summary = pool.get(&id.pkg).unwrap().paths.get(&id.id);
+    fn new(pool: Rc<ItemPool>, id: ItemId) -> Rc<Self> {
+        let item_summary = pool.crates.get(&id.pkg).unwrap().paths.get(&id.id);
         let path = item_summary
             .map(|summ| summ.path.iter().rev().skip(1).rev().collect::<PathBuf>())
             .unwrap();
@@ -163,9 +206,9 @@ impl CachedItem {
         Self::new_with_path(pool, id, path)
     }
 
-    pub fn new_with_path(pool: Rc<HashMap<String, Crate>>, id: ItemId, path: PathBuf) -> Self {
-        let item = pool.get(&id.pkg).unwrap().index.get(&id.id).unwrap();
-        let item_summary = pool.get(&id.pkg).unwrap().paths.get(&id.id);
+    fn new_with_path(pool: Rc<ItemPool>, id: ItemId, path: PathBuf) -> Rc<Self> {
+        let item = pool.crates.get(&id.pkg).unwrap().index.get(&id.id);
+        let item_summary = pool.crates.get(&id.pkg).unwrap().paths.get(&id.id);
 
         // Save path information for associated function of a struct
         // which does not have an ItemSummary.
@@ -173,45 +216,43 @@ impl CachedItem {
             .map(|summ| summ.path.iter().rev().skip(1).rev().collect::<PathBuf>())
             .unwrap_or(path);
 
-        Self {
+        Rc::new(Self {
             pool: pool.clone(),
             id: id.clone(),
-            item: item.clone(),
-            item_summary: item_summary.cloned(),
+            item: item.cloned(), // None for items in the core library
+            item_summary: item_summary.cloned(), // None for associated functions
             path,
-        }
+        })
     }
 
-    fn associated_methods(&self) -> Vec<CachedItem> {
-        let crate_ = self.pool.get(&self.id.pkg).unwrap();
-
-        match &self.item.inner {
-            ItemEnum::Struct(ref s) => s
-                .impls
-                .iter()
-                .filter_map(|id| crate_.index.get(id))
-                .filter_map(|item| match item.inner {
-                    ItemEnum::Impl(ref impl_) => match impl_.trait_ {
-                        Some(_) => None,
-                        None => Some(&impl_.items),
-                    },
-                    _ => None,
-                })
-                .flatten()
-                .map(|id| {
-                    CachedItem::new_with_path(
-                        self.pool.clone(),
-                        ItemId::new(self.id.pkg.clone(), id.clone()),
-                        (self.path.join(self.item.name.as_ref().unwrap())).clone(),
-                    )
-                })
-                .collect(),
-            _ => vec![],
+    fn associated_methods(&self) -> Vec<Rc<CachedItem>> {
+        if let Some(item) = &self.item {
+            let crate_ = self.pool.crates.get(&self.id.pkg).unwrap();
+            match &item.inner {
+                ItemEnum::Struct(ref s) => s
+                    .impls
+                    .iter()
+                    .filter_map(|id| crate_.index.get(id))
+                    .filter_map(|item| match item.inner {
+                        ItemEnum::Impl(ref impl_) => match impl_.trait_ {
+                            Some(_) => None,
+                            None => Some(&impl_.items),
+                        },
+                        _ => None,
+                    })
+                    .flatten()
+                    .map(|id| {
+                        self.pool.clone().insert_with_path(
+                            &ItemId::new(self.id.pkg.clone(), id.clone()),
+                            self.path.join(item.name.as_ref().unwrap()),
+                        )
+                    })
+                    .collect(),
+                _ => vec![],
+            }
+        } else {
+            vec![]
         }
-    }
-
-    pub fn crate_(&self) -> &Crate {
-        self.pool.get(&self.id.pkg).unwrap()
     }
 
     fn kind(&self) -> &ItemKind {
@@ -221,14 +262,73 @@ impl CachedItem {
         }
     }
 
+    fn crate_version(&self) -> &str {
+        self.pool
+            .crates
+            .get(&self.id.pkg)
+            .map(|c| c.crate_version.as_deref().unwrap())
+            .unwrap()
+    }
+
+    fn url_path(&self) -> String {
+        self.path
+            .iter()
+            .map(|s| s.to_str().unwrap())
+            .collect::<Vec<&str>>()
+            .join("/")
+    }
+
+    fn html_root_url(&self) -> String {
+        let root_url = self.pool.crates.get(&self.id.pkg).and_then(|c| {
+            c.external_crates
+                .get(
+                    &(self.item.as_ref())
+                        .map(|item| item.crate_id)
+                        .or(self.item_summary.as_ref().map(|summ| summ.crate_id))
+                        .unwrap(),
+                )
+                .and_then(|c| c.html_root_url.as_deref())
+        });
+
+        match root_url {
+            Some(url) => url.to_string(),
+            None => {
+                let pkg = (self.path().iter())
+                    .flat_map(|p| p.to_str())
+                    .next()
+                    .map(|s| s.to_string())
+                    .unwrap();
+                if self.pool.crates.keys().any(|k| k == &pkg) {
+                    format!("https://docs.rs/{}/{}/", pkg, self.crate_version())
+                } else {
+                    // For external crates
+                    format!("https://docs.rs/{}/latest/", pkg)
+                }
+            }
+        }
+    }
+
     fn docs(&self) -> String {
-        hide_code_block_lines(self.item.docs.as_deref().unwrap_or(""))
+        hide_code_block_lines(
+            self.item
+                .as_ref()
+                .and_then(|item| item.docs.as_deref())
+                .unwrap_or(""),
+        )
     }
 }
 
 impl Name for CachedItem {
     fn name(&self) -> &str {
-        self.item.name.as_deref().unwrap_or("")
+        self.item
+            .as_ref()
+            .and_then(|item| item.name.as_deref())
+            .or(self
+                .item_summary
+                .as_ref()
+                .and_then(|summ| summ.path.last())
+                .map(|s| s.as_str()))
+            .unwrap()
     }
 }
 
@@ -238,17 +338,29 @@ impl ModulePath for CachedItem {
     }
 }
 
-impl<'a, T> RelativeTo<'a, T> for CachedItem
+impl<T> RelativeTo<T> for CachedItem
 where
     T: ModulePath,
 {
-    fn relative_to(&'a self, other: &T) -> PathBuf {
+    fn relative_to(&self, other: &T) -> PathBuf {
         self.path().relative_to(&other.path())
     }
 }
 
-impl<'a> Repr<'a> for CachedItem {
-    fn repr(&self, _root: &'a CachedItem) -> String {
+impl ExternalLink for CachedItem {
+    fn external_link(&self, _: &CachedItem) -> String {
+        format!(
+            "{}{}/{}.{}.html",
+            self.html_root_url(),
+            self.url_path(),
+            serde_plain::to_string(self.kind()).unwrap(),
+            self.name()
+        )
+    }
+}
+
+impl Repr for CachedItem {
+    fn repr(&self, _root: &CachedItem) -> String {
         match self.kind() {
             ItemKind::Function => {
                 let name = self.name();
@@ -268,7 +380,7 @@ impl<'a> Repr<'a> for CachedItem {
 "#,
                     name,
                     name,
-                    &self.item.inner.repr(self),
+                    &self.item.as_ref().unwrap().inner.repr(self),
                     self.docs()
                 )
             }
@@ -281,7 +393,7 @@ impl<'a> Repr<'a> for CachedItem {
                         format!(
                             "| {} | {} |",
                             self.cross_ref_md(&method),
-                            caption(&method.item)
+                            caption(method.item.as_ref().unwrap())
                         )
                     })
                     .collect::<Vec<String>>()
@@ -304,8 +416,8 @@ impl<'a> Repr<'a> for CachedItem {
     }
 }
 
-impl<'a> Repr<'a> for ItemEnum {
-    fn repr(&self, root: &'a CachedItem) -> String {
+impl Repr for ItemEnum {
+    fn repr(&self, root: &CachedItem) -> String {
         match self {
             ItemEnum::Function(func) => {
                 format!(
@@ -343,31 +455,9 @@ impl ExternalLink for Type {
             Type::Primitive(p) => format!("https://doc.rust-lang.org/std/primitive.{}.html", p),
 
             Type::ResolvedPath(p) => {
-                let crate_ = root.crate_();
-                let crate_id = crate_.index.get(&p.id).map(|item| item.crate_id).unwrap();
-
-                if crate_id == 0 {
-                    let path = crate_
-                        .paths
-                        .get(&p.id)
-                        .map(|s| s.path.join("/"))
-                        .unwrap_or("".to_string());
-                    format!(
-                        "https://docs.rs/{}/{}/{}",
-                        root.id.pkg,
-                        crate_.crate_version.as_deref().unwrap(),
-                        path
-                    )
-                } else {
-                    let root_url = crate_
-                        .external_crates
-                        .get(&crate_id)
-                        .and_then(|c| c.html_root_url.as_deref());
-                    match root_url {
-                        Some(url) => url.to_string(),
-                        None => "".to_string(),
-                    }
-                }
+                let id = ItemId::new(root.id.pkg.clone(), p.id.clone());
+                let item = root.clone().pool.get(&id);
+                item.external_link(root)
             }
 
             _ => unimplemented!(),
@@ -375,8 +465,8 @@ impl ExternalLink for Type {
     }
 }
 
-impl<'a> Repr<'a> for Type {
-    fn repr(&self, root: &'a CachedItem) -> String {
+impl Repr for Type {
+    fn repr(&self, root: &CachedItem) -> String {
         match self {
             Type::Primitive(p) => format!("<a href=\"{}\">{}</a>", self.external_link(root), p),
 
@@ -452,8 +542,8 @@ impl<'a> Repr<'a> for Type {
     }
 }
 
-impl<'a> Repr<'a> for TypeBinding {
-    fn repr(&self, root: &'a CachedItem) -> String {
+impl Repr for TypeBinding {
+    fn repr(&self, root: &CachedItem) -> String {
         format!(
             "{}{}{}",
             self.name,
@@ -474,8 +564,8 @@ impl<'a> Repr<'a> for TypeBinding {
     }
 }
 
-impl<'a> Repr<'a> for GenericArgs {
-    fn repr(&self, root: &'a CachedItem) -> String {
+impl Repr for GenericArgs {
+    fn repr(&self, root: &CachedItem) -> String {
         match self {
             GenericArgs::AngleBracketed { args, bindings } => {
                 if !args.is_empty() || !bindings.is_empty() {
@@ -501,17 +591,14 @@ impl<'a> Repr<'a> for GenericArgs {
     }
 }
 
-impl doc_traits::ItemId for rustdoc_types::Path {
-    fn id(&self) -> &Id {
-        &self.id
-    }
-}
+impl Repr for rustdoc_types::Path {
+    fn repr(&self, root: &CachedItem) -> String {
+        let id = ItemId::new(root.id.pkg.clone(), self.id.clone());
+        let item = root.pool.clone().get(&id);
 
-impl<'a> Repr<'a> for rustdoc_types::Path {
-    fn repr(&self, root: &'a CachedItem) -> String {
         format!(
             "<a href=\"{}\">{}</a>{}",
-            self.external_link(root),
+            item.external_link(root),
             self.name,
             self.args
                 .as_deref()
@@ -521,8 +608,8 @@ impl<'a> Repr<'a> for rustdoc_types::Path {
     }
 }
 
-impl<'a> Repr<'a> for GenericBound {
-    fn repr(&self, root: &'a CachedItem) -> String {
+impl Repr for GenericBound {
+    fn repr(&self, root: &CachedItem) -> String {
         match self {
             GenericBound::TraitBound {
                 trait_,
