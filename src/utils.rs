@@ -15,16 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::{
-    ffi::OsStr,
-    iter::zip,
-    path::{Path, PathBuf},
-};
-
 use regex::RegexBuilder;
 use rustdoc_types::Item;
-
-use crate::doc_traits::RelativeTo;
 
 pub fn caption(item: &Item) -> String {
     let re = RegexBuilder::new(r"(?:^\s*\n*)*(?P<caption>^\w*.*)(?:\n?)$?")
@@ -97,26 +89,4 @@ pub fn hide_code_block_lines(docs: &str) -> String {
     }
 
     filtered_docs.join("\n")
-}
-
-impl<P> RelativeTo<P> for Path
-where
-    P: AsRef<Path>,
-{
-    fn relative_to(&self, other: &P) -> PathBuf {
-        let left = self.iter().collect::<Vec<&OsStr>>();
-        let right = other.as_ref().iter().collect::<Vec<&OsStr>>();
-
-        let mut d = 0;
-        for (l, r) in zip(left.iter(), right.iter()) {
-            if l == r {
-                d += 1
-            }
-        }
-
-        (0..(left.len() - d))
-            .map(|_| OsStr::new(".."))
-            .chain(right.into_iter().skip(d))
-            .collect()
-    }
 }

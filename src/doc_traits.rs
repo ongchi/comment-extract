@@ -15,8 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::path::PathBuf;
-
 use crate::segment::CachedItem;
 
 pub(crate) trait Repr {
@@ -28,11 +26,11 @@ pub(crate) trait Name {
 }
 
 pub(crate) trait ModulePath {
-    fn path(&self) -> PathBuf;
+    fn path(&self) -> &Vec<String>;
 }
 
 pub(crate) trait RelativeTo<T> {
-    fn relative_to(&self, other: &T) -> PathBuf;
+    fn relative_to(&self, other: &T) -> Vec<String>;
 }
 
 pub(crate) trait CrossRef<T> {
@@ -47,17 +45,13 @@ where
 {
     fn cross_ref(&self, to: &T) -> String {
         self.relative_to(to)
-            .join(format!("{}.md", to.name()))
-            .to_str()
-            .unwrap()
-            .to_string()
+            .into_iter()
+            .chain([format!("{}.md", to.name())])
+            .collect::<Vec<String>>()
+            .join("/")
     }
 
     fn cross_ref_md(&self, to: &T) -> String {
         format!("[{}]({})", to.name(), self.cross_ref(to))
     }
-}
-
-pub(crate) trait ExternalLink {
-    fn external_link(&self, root: &CachedItem) -> String;
 }
