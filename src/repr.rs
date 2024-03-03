@@ -178,7 +178,7 @@ impl Repr for Type {
                     .join(", ")
             ),
 
-            Type::Slice(slice) => format!("[{}]", slice.repr(root)),
+            Type::Slice(slice) => format!("&[{}]", slice.repr(root)),
 
             Type::Array { type_, len } => {
                 format!("[{}: {}]", type_.repr(root), len)
