@@ -262,13 +262,19 @@ impl CachedItem {
     }
 
     pub fn kind(&self) -> &ItemKind {
-        match self.item_summary() {
-            Some(summ) => &summ.kind,
-            // Associated method of a struct does not have an `ItemSummary`. Since a method will be
-            // no different to a function during document generation.
-            // Simply returning an `ItemKind::Function` in this case will be sufficient.
-            None => &ItemKind::Function,
-        }
+        self.item_summary()
+            .map(|summ| &summ.kind)
+            .unwrap_or_else(|| match self.item() {
+                Some(item) => match &item.inner {
+                    ItemEnum::Function(_) => &ItemKind::Function,
+                    ItemEnum::Enum(_) => &ItemKind::Enum,
+                    ItemEnum::Struct(_) => &ItemKind::Struct,
+                    _ => {
+                        unimplemented!()
+                    }
+                },
+                None => unreachable!(),
+            })
     }
 
     pub fn name(&self) -> &str {
@@ -282,12 +288,21 @@ impl CachedItem {
     }
 
     fn path(&self) -> Vec<&str> {
-        self.item_summary()
+        if let Some(path) = self
+            .item_summary()
             .map(|summ| summ.path.as_ref())
             .or(self.path.as_ref())
             .map(|path| path.iter().map(|p| p.as_str()))
-            .unwrap()
-            .collect()
+        {
+            path.collect()
+        } else {
+            // Assume root item when path information not found.
+            let path = (self.pool.crates.get(&self.id.pkg))
+                .and_then(|crate_| crate_.index.get(&crate_.root))
+                .and_then(|item| item.name.as_deref())
+                .unwrap();
+            vec![path, self.name()]
+        }
     }
 }
 
