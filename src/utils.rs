@@ -18,7 +18,8 @@
 use regex::RegexBuilder;
 use rustdoc_types::Item;
 
-pub fn caption(item: &Item) -> String {
+// Get first line of docs as caption
+pub fn caption(item: &Item) -> &str {
     let re = RegexBuilder::new(r"(?:^\s*\n*)*(?P<caption>^\w*.*)(?:\n?)$?")
         .multi_line(true)
         .build()
@@ -26,12 +27,10 @@ pub fn caption(item: &Item) -> String {
 
     item.docs
         .as_ref()
-        .and_then(|docs| {
-            re.captures(docs)
-                .map(|cap| cap.name("caption").map(|m| m.as_str()).unwrap_or(""))
-        })
+        .and_then(|docs| re.captures(docs))
+        .and_then(|cap| cap.name("caption"))
+        .map(|match_| match_.as_str())
         .unwrap_or("")
-        .to_string()
 }
 
 // Remove lines starts with `#` in code blocks

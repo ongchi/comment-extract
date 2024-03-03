@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-mod doc_traits;
+mod repr;
 mod segment;
 mod utils;
 
